@@ -277,6 +277,11 @@ export default {
 					await axios.post(this.resolve("/api/v1/message/" + msgID + "/release"), { To: allRecipients });
 				}
 
+				// Mark sent message as read (we sent it, so it's not unread)
+				if (msgID) {
+					await axios.put(this.resolve("/api/v1/messages"), { Read: true, IDs: [msgID] });
+				}
+
 				this.sending = false;
 				this.modal("ComposeModal").hide();
 			} catch (error) {
