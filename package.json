@@ -26,6 +26,7 @@
     "ical.js": "^2.0.1",
     "mitt": "^3.0.1",
     "modern-screenshot": "^4.4.30",
+    "quill": "^2.0.3",
     "rapidoc": "^12.0.0",
     "timezones-list": "^3.0.3",
     "vue": "^3.2.13",
