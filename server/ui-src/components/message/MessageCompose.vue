@@ -2,6 +2,7 @@
 import AjaxLoader from "../AjaxLoader.vue";
 import axios from "axios";
 import commonMixins from "../../mixins/CommonMixins";
+import DOMPurify from "dompurify";
 import { mailbox } from "../../stores/mailbox";
 import Quill from "quill";
 
@@ -140,25 +141,31 @@ export default {
 			const fromStr = originalFrom ? this.formatAddress(originalFrom) : "unknown";
 			const dateStr = this.message.Date ? new Date(this.message.Date).toLocaleString() : "unknown";
 
+			const quotedFromLine =
+				"<p><strong>" +
+				this.escapeHtml(fromStr) +
+				"</strong> wrote on <em>" +
+				this.escapeHtml(dateStr) +
+				"</em>:</p>";
+
 			if (this.message.HTML) {
+				const sanitized = DOMPurify.sanitize(this.message.HTML, {
+					WHOLE_DOCUMENT: true,
+					FORBID_TAGS: ["script", "form"],
+					ALLOW_UNKNOWN_PROTOCOLS: true,
+				});
 				this.htmlBody =
 					"<br><br><blockquote style='border-left:2px solid #ccc;margin:0;padding:0 0 0 8px'>" +
-					"<p><strong>" +
-					this.escapeHtml(fromStr) +
-					"</strong> wrote on <em>" +
-					this.escapeHtml(dateStr) +
-					"</em>:</p>" +
-					this.message.HTML +
-					"</blockquote>";
+					quotedFromLine +
+					"<div style='all:initial;background:#fff;color:#000;padding:8px;font-family:Arial,sans-serif;font-size:14px;line-height:1.4'>" +
+					sanitized +
+					"</div></blockquote>";
 			} else if (quoteText) {
 				this.textBody = "\n\n\n--- " + fromStr + " wrote on " + dateStr + " ---\n" + quoteText;
 				this.htmlBody =
 					"<br><br><blockquote style='border-left:2px solid #ccc;margin:0;padding:0 0 0 8px'>" +
-					"<p><strong>" +
-					this.escapeHtml(fromStr) +
-					"</strong> wrote on <em>" +
-					this.escapeHtml(dateStr) +
-					"</em>:</p><pre>" +
+					quotedFromLine +
+					"<pre style='background:#fff;color:#000;padding:8px;font-family:monospace;font-size:13px'>" +
 					this.escapeHtml(this.message.Text) +
 					"</pre></blockquote>";
 			}
@@ -425,15 +432,37 @@ export default {
 .quill-editor :deep(.ql-toolbar) {
 	border-top-left-radius: 0.375rem;
 	border-top-right-radius: 0.375rem;
+	background: #fff;
+	color: #000;
+}
+
+.quill-editor :deep(.ql-toolbar .ql-stroke) {
+	stroke: #444;
+}
+
+.quill-editor :deep(.ql-toolbar .ql-fill) {
+	fill: #444;
+}
+
+.quill-editor :deep(.ql-toolbar .ql-picker-label) {
+	color: #444;
 }
 
 .quill-editor :deep(.ql-container) {
 	border-bottom-left-radius: 0.375rem;
 	border-bottom-right-radius: 0.375rem;
 	min-height: 250px;
+	background: #fff;
+	color: #000;
 }
 
 .quill-editor :deep(.ql-editor) {
 	min-height: 250px;
+	background: #fff;
+	color: #000;
+}
+
+.quill-editor :deep(.ql-editor.ql-blank::before) {
+	color: #888;
 }
 </style>
