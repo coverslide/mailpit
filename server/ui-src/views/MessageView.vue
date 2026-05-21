@@ -4,6 +4,7 @@ import AjaxLoader from "../components/AjaxLoader.vue";
 import CommonMixins from "../mixins/CommonMixins";
 import Message from "../components/message/MessageItem.vue";
 import Release from "../components/message/MessageRelease.vue";
+import Compose from "../components/message/MessageCompose.vue";
 import Screenshot from "../components/message/MessageScreenshot.vue";
 import { mailbox } from "../stores/mailbox";
 import { pagination } from "../stores/pagination";
@@ -13,6 +14,7 @@ export default {
 	components: {
 		AboutMailpit,
 		AjaxLoader,
+		Compose,
 		Message,
 		Screenshot,
 		Release,
@@ -29,6 +31,8 @@ export default {
 			pagination,
 			message: false,
 			loadReleaseModal: false,
+			loadComposeModal: false,
+			composeMode: "compose",
 			errorMessage: false,
 			apiSideNavURI: false,
 			apiSideNavParams: URLSearchParams,
@@ -470,6 +474,39 @@ export default {
 				});
 			});
 		},
+
+		initComposeModal() {
+			this.composeMode = "compose";
+			this.loadComposeModal = false;
+			this.$nextTick(() => {
+				this.loadComposeModal = true;
+				this.$nextTick(() => {
+					this.modal("ComposeModal").show();
+				});
+			});
+		},
+
+		initReplyModal() {
+			this.composeMode = "reply";
+			this.loadComposeModal = false;
+			this.$nextTick(() => {
+				this.loadComposeModal = true;
+				this.$nextTick(() => {
+					this.modal("ComposeModal").show();
+				});
+			});
+		},
+
+		initReplyAllModal() {
+			this.composeMode = "replyAll";
+			this.loadComposeModal = false;
+			this.$nextTick(() => {
+				this.loadComposeModal = true;
+				this.$nextTick(() => {
+					this.modal("ComposeModal").show();
+				});
+			});
+		},
 	},
 };
 </script>
@@ -490,6 +527,33 @@ export default {
 			<button class="btn btn-outline-light me-1 me-sm-2" title="Mark unread" @click="toggleRead()">
 				<i class="bi bi-eye-slash me-md-2" :class="isRead ? 'bi-eye-slash' : 'bi-eye'"></i>
 				<span class="d-none d-md-inline">Mark <template v-if="isRead">un</template>read</span>
+			</button>
+			<button
+				v-if="mailbox.uiConfig.MessageRelay && mailbox.uiConfig.MessageRelay.Enabled"
+				class="btn btn-outline-light me-1 me-sm-2"
+				title="Send new message"
+				@click="initComposeModal()"
+			>
+				<i class="bi bi-pencil-fill me-md-2"></i>
+				<span class="d-none d-md-inline">Send</span>
+			</button>
+			<button
+				v-if="message && mailbox.uiConfig.MessageRelay && mailbox.uiConfig.MessageRelay.Enabled"
+				class="btn btn-outline-light me-1 me-sm-2"
+				title="Reply to sender"
+				@click="initReplyModal()"
+			>
+				<i class="bi bi-reply-fill me-md-2"></i>
+				<span class="d-none d-md-inline">Reply</span>
+			</button>
+			<button
+				v-if="message && mailbox.uiConfig.MessageRelay && mailbox.uiConfig.MessageRelay.Enabled"
+				class="btn btn-outline-light me-1 me-sm-2"
+				title="Reply to all"
+				@click="initReplyAllModal()"
+			>
+				<i class="bi bi-reply-all-fill me-md-2"></i>
+				<span class="d-none d-md-inline">Reply all</span>
 			</button>
 			<button
 				v-if="mailbox.uiConfig.MessageRelay && mailbox.uiConfig.MessageRelay.Enabled"
@@ -723,6 +787,12 @@ export default {
 
 	<AboutMailpit modals />
 	<AjaxLoader :loading="loading" />
+	<Compose
+		v-if="mailbox.uiConfig.MessageRelay && loadComposeModal"
+		ref="ComposeRef"
+		:message="message"
+		:mode="composeMode"
+	/>
 	<Release
 		v-if="mailbox.uiConfig.MessageRelay && loadReleaseModal"
 		ref="ReleaseRef"

@@ -382,6 +382,9 @@ body.blur {
 	}
 }
 
+// Quill WYSIWYG editor styles
+@import "quill/dist/quill.snow.css";
+
 // HighlightJS for HTML rendering
 @import "highlight.js/styles/github.css";
 
