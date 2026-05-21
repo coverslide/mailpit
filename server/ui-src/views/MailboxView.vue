@@ -2,6 +2,7 @@
 import About from "../components/AppAbout.vue";
 import AjaxLoader from "../components/AjaxLoader.vue";
 import CommonMixins from "../mixins/CommonMixins";
+import Compose from "../components/message/MessageCompose.vue";
 import ListMessages from "../components/ListMessages.vue";
 import MessagesMixins from "../mixins/MessagesMixins";
 import NavMailbox from "../components/NavMailbox.vue";
@@ -15,6 +16,7 @@ export default {
 	components: {
 		About,
 		AjaxLoader,
+		Compose,
 		ListMessages,
 		NavMailbox,
 		NavTags,
@@ -30,6 +32,7 @@ export default {
 	data() {
 		return {
 			mailbox,
+			loadComposeModal: false,
 			delayedRefresh: false,
 			paginationDelayed: false, // for delayed pagination URL changes
 		};
@@ -62,6 +65,16 @@ export default {
 	},
 
 	methods: {
+		initComposeModal() {
+			this.loadComposeModal = false;
+			this.$nextTick(() => {
+				this.loadComposeModal = true;
+				this.$nextTick(() => {
+					this.modal("ComposeModal").show();
+				});
+			});
+		},
+
 		loadMailbox() {
 			const paginationParams = this.getPaginationParams();
 			if (paginationParams?.start) {
@@ -198,6 +211,15 @@ export default {
 					<i class="bi bi-list"></i>
 				</button>
 			</div>
+			<button
+				v-if="mailbox.uiConfig.MessageRelay && mailbox.uiConfig.MessageRelay.Enabled"
+				class="btn btn-outline-light me-2"
+				title="Send new message"
+				@click="initComposeModal()"
+			>
+				<i class="bi bi-pencil-fill"></i>
+				<span class="d-none d-sm-inline ms-1">Send</span>
+			</button>
 			<Pagination :total="mailbox.total" />
 		</div>
 	</div>
@@ -246,6 +268,11 @@ export default {
 		</div>
 	</div>
 
+	<Compose
+		v-if="mailbox.uiConfig.MessageRelay && loadComposeModal"
+		ref="ComposeRef"
+		:mode="'compose'"
+	/>
 	<NavMailbox modals @load-messages="loadMessages" />
 	<About modals />
 	<AjaxLoader :loading="loading" />

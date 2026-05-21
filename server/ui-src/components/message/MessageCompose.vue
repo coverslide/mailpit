@@ -42,7 +42,25 @@ export default {
 	},
 
 	mounted() {
-		this.initCompose();
+		if (this.mode === "reply" || this.mode === "replyAll") {
+			this.prefillReply();
+		}
+
+		// Set content in editor div before Quill init (Quill picks it up)
+		const editor = document.getElementById("ComposeEditor");
+		if (editor && this.htmlBody) {
+			editor.innerHTML = this.htmlBody;
+		}
+
+		// Initialize Quill after the modal is fully shown
+		const modalEl = document.getElementById("ComposeModal");
+		if (modalEl) {
+			modalEl.addEventListener("shown.bs.modal", () => {
+				this.$nextTick(() => {
+					this.initQuill();
+				});
+			});
+		}
 	},
 
 	beforeUnmount() {
@@ -52,40 +70,25 @@ export default {
 	},
 
 	methods: {
-		initCompose() {
-			if (this.mode === "reply" || this.mode === "replyAll") {
-				this.prefillReply();
-			}
-
-			// Initialize Quill when modal is shown (needs visible dimensions)
-			const modalEl = document.getElementById("ComposeModal");
-			if (modalEl) {
-				const initHandler = () => {
-					this.$nextTick(() => {
-						this.initQuill();
-					});
-					modalEl.removeEventListener("shown.bs.modal", initHandler);
-				};
-				modalEl.addEventListener("shown.bs.modal", initHandler);
-			}
-		},
 
 		prefillReply() {
 			if (!this.message) return;
 
 			const originalFrom = this.message.From;
+			const originalReplyTo = this.message.ReplyTo;
 			const originalTo = this.message.To || [];
 			const originalCc = this.message.Cc || [];
 
-			// From: original To (first recipient)
+			// From: original To (first recipient) — we are replying as the recipient
 			if (originalTo.length > 0) {
 				this.from = this.formatAddress(originalTo[0]);
 			}
 
-			// To: original From
+			// To: original Reply-To (if set), otherwise original From (RFC 5322)
 			const toList = [];
-			if (originalFrom) {
-				toList.push(this.formatAddress(originalFrom));
+			const replyTarget = originalReplyTo && originalReplyTo.length > 0 ? originalReplyTo[0] : originalFrom;
+			if (replyTarget) {
+				toList.push(this.formatAddress(replyTarget));
 			}
 
 			// Reply All: also include To and Cc except our own from address
@@ -163,7 +166,7 @@ export default {
 
 		initQuill() {
 			const editor = document.getElementById("ComposeEditor");
-			if (!editor) return;
+			if (!editor || this.quill) return;
 
 			this.quill = new Quill(editor, {
 				theme: "snow",
@@ -179,10 +182,6 @@ export default {
 				},
 				placeholder: "Compose your message...",
 			});
-
-			if (this.htmlBody) {
-				this.quill.root.innerHTML = this.htmlBody;
-			}
 		},
 
 		getQuillHTML() {
@@ -209,9 +208,10 @@ export default {
 			return div.innerHTML;
 		},
 
-		sendMessage() {
+		async sendMessage() {
 			if (this.sending) return;
 			this.sending = true;
+			this.loading++;
 
 			const html = this.getQuillHTML();
 			const text = this.getQuillText();
@@ -219,6 +219,7 @@ export default {
 			if (!this.from) {
 				alert("Please enter a From address.");
 				this.sending = false;
+				this.loading--;
 				return;
 			}
 
@@ -226,6 +227,7 @@ export default {
 			if (!toList.length) {
 				alert("Please enter at least one recipient.");
 				this.sending = false;
+				this.loading--;
 				return;
 			}
 
@@ -253,50 +255,48 @@ export default {
 				};
 			}
 
-			this.loading++;
-			axios
-				.post(this.resolve("/api/v1/send"), sendPayload)
-				.then((response) => {
-					const msgID = response.data.ID;
+			try {
+				// Step 1: Save message to database via send API
+				const sendResp = await axios.post(this.resolve("/api/v1/send"), sendPayload);
+				const msgID = sendResp.data.ID;
 
-					// Collect all recipient addresses for relay
-					const allRecipients = [];
-					for (const a of toList) {
-						if (a.Email) allRecipients.push(a.Email);
-					}
-					for (const a of ccList) {
-						if (a.Email) allRecipients.push(a.Email);
-					}
-					for (const a of bccList) {
-						if (a) allRecipients.push(a);
-					}
+				// Collect all recipient addresses for relay
+				const allRecipients = [];
+				for (const a of toList) {
+					if (a.Email) allRecipients.push(a.Email);
+				}
+				for (const a of ccList) {
+					if (a.Email) allRecipients.push(a.Email);
+				}
+				for (const a of bccList) {
+					if (a) allRecipients.push(a);
+				}
 
-					// Step 2: Relay via SMTP
-					if (allRecipients.length && msgID) {
-						return axios.post(this.resolve("/api/v1/message/" + msgID + "/release"), { To: allRecipients });
+				// Step 2: Relay via SMTP if there are recipients and a valid ID
+				if (allRecipients.length && msgID) {
+					await axios.post(this.resolve("/api/v1/message/" + msgID + "/release"), { To: allRecipients });
+				}
+
+				this.sending = false;
+				this.modal("ComposeModal").hide();
+			} catch (error) {
+				this.sending = false;
+				let msg = "Error sending message.";
+				if (error.response && error.response.data) {
+					if (error.response.data.Error) {
+						msg = error.response.data.Error;
+					} else if (typeof error.response.data === "string") {
+						msg = error.response.data;
 					}
-				})
-				.then(() => {
-					this.sending = false;
-					this.modal("ComposeModal").hide();
-				})
-				.catch((error) => {
-					this.sending = false;
-					if (error.response && error.response.data) {
-						if (error.response.data.Error) {
-							alert(error.response.data.Error);
-						} else {
-							alert(error.response.data);
-						}
-					} else if (error.request) {
-						alert("Error sending data to the server. Please try again.");
-					} else {
-						alert(error.message);
-					}
-				})
-				.finally(() => {
-					if (this.loading > 0) this.loading--;
-				});
+				} else if (error.request) {
+					msg = "Error sending data to the server. Please try again.";
+				} else if (error.message) {
+					msg = error.message;
+				}
+				alert(msg);
+			} finally {
+				if (this.loading > 0) this.loading--;
+			}
 		},
 
 		parseAddressInput(str) {
