@@ -358,8 +358,8 @@ export default {
 				this.imageProcessing = true;
 				const reader = new FileReader();
 				reader.onload = (e) => {
-					this.quill.insertEmbed(index, "image", e.target.result);
-					this.quill.setSelection(index + 1);
+					this.quill.insertEmbed(index, "image", e.target.result, "silent");
+					this.quill.setSelection(index + 1, 0, "silent");
 					this.imageProcessing = false;
 				};
 				reader.readAsDataURL(file);
