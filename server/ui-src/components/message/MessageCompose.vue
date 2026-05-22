@@ -3,6 +3,7 @@ import AjaxLoader from "../AjaxLoader.vue";
 import axios from "axios";
 import commonMixins from "../../mixins/CommonMixins";
 import DOMPurify from "dompurify";
+import { markRaw } from "vue";
 import { mailbox } from "../../stores/mailbox";
 import Quill from "quill";
 
@@ -177,7 +178,7 @@ export default {
 			const editor = document.getElementById("ComposeEditor");
 			if (!editor || this.quill) return;
 
-			this.quill = new Quill(editor, {
+			this.quill = markRaw(new Quill(editor, {
 				theme: "snow",
 				modules: {
 					toolbar: {
@@ -195,7 +196,7 @@ export default {
 					},
 				},
 				placeholder: "Compose your message...",
-			});
+			}));
 		},
 
 		getQuillHTML() {
