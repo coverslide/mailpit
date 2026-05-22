@@ -12,9 +12,11 @@ import (
 	"net/mail"
 	"strings"
 
+	"github.com/PuerkitoBio/goquery"
 	"github.com/axllent/mailpit/config"
 	"github.com/axllent/mailpit/internal/smtpd"
 	"github.com/axllent/mailpit/internal/tools"
+	"github.com/google/uuid"
 	"github.com/jhillyerd/enmime/v2"
 )
 
@@ -103,6 +105,10 @@ func (d sendMessageParams) Send(remoteAddr string, httpAuthUser *string) (string
 		Text([]byte(d.Body.Text))
 
 	if d.Body.HTML != "" {
+		d.Body.HTML = convertDataURIToCID(d.Body.HTML, func(data []byte, contentType, cid string) {
+			ext := cidExt(contentType)
+			msg = msg.AddInline(data, contentType, "inline"+ext, cid)
+		})
 		msg = msg.HTML([]byte(d.Body.HTML))
 	}
 
@@ -200,4 +206,95 @@ func (d sendMessageParams) Send(remoteAddr string, httpAuthUser *string) (string
 	}
 
 	return smtpd.SaveToDatabase(ipAddr, d.Body.From.Email, addresses, buff.Bytes(), httpAuthUser)
+}
+
+// convertDataURIToCID scans HTML for <img> tags with data URIs, decodes them,
+// replaces the src with a cid: reference, and invokes addInline for each.
+// It returns the modified HTML.
+func convertDataURIToCID(html string, addInline func(data []byte, contentType, cid string)) string {
+	if html == "" {
+		return html
+	}
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
+	if err != nil {
+		return html
+	}
+
+	modified := false
+	doc.Find("img[src]").Each(func(i int, s *goquery.Selection) {
+		src, exists := s.Attr("src")
+		if !exists || !strings.HasPrefix(src, "data:") {
+			return
+		}
+
+		commaIdx := strings.Index(src, ",")
+		if commaIdx < 0 {
+			return
+		}
+
+		header := src[:commaIdx]
+		data := src[commaIdx+1:]
+
+		if !strings.Contains(header, ";base64") {
+			return
+		}
+
+		contentType := ""
+		if ctIdx := strings.Index(header, ":"); ctIdx >= 0 {
+			ctPart := header[ctIdx+1:]
+			if semiIdx := strings.Index(ctPart, ";"); semiIdx >= 0 {
+				contentType = ctPart[:semiIdx]
+			}
+		}
+
+		b, err := base64.StdEncoding.DecodeString(data)
+		if err != nil {
+			return
+		}
+
+		if contentType == "" {
+			contentType = http.DetectContentType(b)
+		}
+
+		cid := strings.ReplaceAll(uuid.New().String(), "-", "") + "@mailpit"
+
+		s.SetAttr("src", "cid:"+cid)
+		modified = true
+
+		addInline(b, contentType, cid)
+	})
+
+	if modified {
+		body := doc.Find("body")
+		if body.Length() > 0 {
+			html, err = body.Html()
+			if err != nil {
+				return html
+			}
+		} else {
+			html, err = doc.Html()
+			if err != nil {
+				return html
+			}
+		}
+	}
+
+	return html
+}
+
+var cidExtMap = map[string]string{
+	"image/jpeg": ".jpg",
+	"image/png":  ".png",
+	"image/gif":  ".gif",
+	"image/webp": ".webp",
+	"image/bmp":  ".bmp",
+	"image/svg+xml": ".svg",
+}
+
+func cidExt(contentType string) string {
+	if ext, ok := cidExtMap[contentType]; ok {
+		return ext
+	}
+	return ".bin"
 }

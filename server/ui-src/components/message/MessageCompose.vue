@@ -39,6 +39,8 @@ export default {
 			quill: null,
 			originalMessageID: "",
 			sending: false,
+			attachments: [],
+			imageProcessing: false,
 		};
 	},
 
@@ -178,14 +180,19 @@ export default {
 			this.quill = new Quill(editor, {
 				theme: "snow",
 				modules: {
-					toolbar: [
-						[{ header: [1, 2, 3, false] }],
-						["bold", "italic", "underline", "strike"],
-						[{ list: "ordered" }, { list: "bullet" }],
-						["blockquote", "code-block"],
-						["link"],
-						["clean"],
-					],
+					toolbar: {
+						container: [
+							[{ header: [1, 2, 3, false] }],
+							["bold", "italic", "underline", "strike"],
+							[{ list: "ordered" }, { list: "bullet" }],
+							["blockquote", "code-block"],
+							["link", "image"],
+							["clean"],
+						],
+						handlers: {
+							image: () => this.quillImageHandler(),
+						},
+					},
 				},
 				placeholder: "Compose your message...",
 			});
@@ -252,6 +259,11 @@ export default {
 				Subject: this.subject,
 				HTML: html,
 				Text: text,
+				Attachments: this.attachments.map((a) => ({
+					Content: a.dataUrl,
+					Filename: a.name,
+					ContentType: a.file.type || "",
+				})),
 			};
 
 			// Add threading headers for replies (RFC 5322)
@@ -331,6 +343,57 @@ export default {
 		initTags() {
 			// Address fields are simple text inputs for compose
 		},
+
+		quillImageHandler() {
+			const index = this.quill.getLength();
+
+			const input = document.createElement("input");
+			input.type = "file";
+			input.accept = "image/*";
+			input.multiple = false;
+			input.onchange = () => {
+				const file = input.files[0];
+				if (!file) return;
+
+				this.imageProcessing = true;
+				const reader = new FileReader();
+				reader.onload = (e) => {
+					this.quill.insertEmbed(index, "image", e.target.result);
+					this.quill.setSelection(index + 1);
+					this.imageProcessing = false;
+				};
+				reader.readAsDataURL(file);
+			};
+			input.click();
+		},
+
+		handleAttachmentUpload(event) {
+			const files = event.target.files;
+			for (const file of files) {
+				const reader = new FileReader();
+				reader.onload = (e) => {
+					this.attachments.push({
+						file,
+						name: file.name,
+						size: file.size,
+						dataUrl: e.target.result,
+					});
+				};
+				reader.readAsDataURL(file);
+			}
+			event.target.value = "";
+		},
+
+		removeAttachment(index) {
+			this.attachments.splice(index, 1);
+		},
+
+		formatFileSize(bytes) {
+			if (bytes === 0) return "0 B";
+			const units = ["B", "kB", "MB", "GB"];
+			const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+			return (bytes / Math.pow(1024, i)).toFixed(1) + " " + units[i];
+		},
 	},
 };
 </script>
@@ -402,17 +465,54 @@ export default {
 							<input v-model="subject" type="text" class="form-control form-control-sm" placeholder="Subject" />
 						</div>
 					</div>
-					<div class="mb-2 row align-items-center">
-						<label class="col-sm-2 col-form-label text-body-secondary">Message</label>
-						<div class="col-sm-10">
-							<div
-								id="ComposeEditor"
-								class="quill-editor"
-								style="min-height: 250px; max-height: 50vh; overflow-y: auto"
-							></div>
-						</div>
+			<div class="mb-2 row align-items-start">
+				<label class="col-sm-2 col-form-label text-body-secondary">Message</label>
+				<div class="col-sm-10">
+					<div
+						id="ComposeEditor"
+						class="quill-editor"
+						style="min-height: 250px; max-height: 50vh; overflow-y: auto"
+					></div>
+					<div v-if="imageProcessing" class="mt-1 text-body-secondary small">
+						<i class="bi bi-hourglass-split me-1"></i>Processing image...
 					</div>
 				</div>
+			</div>
+			<div class="mb-2 row align-items-start">
+				<label class="col-sm-2 col-form-label text-body-secondary">Attachments</label>
+				<div class="col-sm-10">
+					<div v-if="attachments.length" class="mb-2">
+						<div
+							v-for="(att, idx) in attachments"
+							:key="idx"
+							class="d-inline-flex align-items-center border rounded px-2 py-1 me-1 mb-1 bg-light"
+						>
+							<i class="bi bi-paperclip me-1 text-body-secondary"></i>
+							<span class="small">{{ att.name }} ({{ formatFileSize(att.size) }})</span>
+							<button
+								type="button"
+								class="btn-close btn-close-sm ms-2"
+								style="font-size: 0.6em"
+								aria-label="Remove"
+								@click="removeAttachment(idx)"
+							></button>
+						</div>
+					</div>
+					<div>
+						<label class="btn btn-outline-secondary btn-sm">
+							<i class="bi bi-paperclip me-1"></i>Attach files
+							<input
+								type="file"
+								multiple
+								class="d-none"
+								@change="handleAttachmentUpload($event)"
+							/>
+						</label>
+						<small class="text-body-secondary ms-2">Attachments are sent as regular email attachments</small>
+					</div>
+				</div>
+			</div>
+		</div>
 				<div class="modal-footer">
 					<button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
 					<button type="button" class="btn btn-primary" :disabled="sending" @click="sendMessage">
