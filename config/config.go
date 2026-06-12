@@ -209,6 +209,21 @@ var (
 	// POP3TLSKey TLS certificate key
 	POP3TLSKey string
 
+	// IMAPConfigFile is the path to the IMAP configuration YAML file
+	IMAPConfigFile string
+
+	// IMAPListen address - if set then Mailpit will start the IMAP server and listen on this address
+	IMAPListen = "[::]:1143"
+
+	// IMAPTLSCert TLS certificate for IMAP
+	IMAPTLSCert string
+
+	// IMAPTLSKey TLS certificate key for IMAP
+	IMAPTLSKey string
+
+	// IMAPConfig is the parsed IMAP configuration
+	IMAPConfig ImapConfigStruct
+
 	// EnableSpamAssassin must be either <host>:<port> or "postmark"
 	EnableSpamAssassin string
 
@@ -552,6 +567,62 @@ func VerifyConfig() error {
 
 		if err := auth.SetPOP3Auth(string(b)); err != nil {
 			return err
+		}
+	}
+
+	// IMAP server
+	if IMAPConfigFile != "" {
+		IMAPConfigFile = filepath.Clean(IMAPConfigFile)
+
+		if !isFile(IMAPConfigFile) {
+			return fmt.Errorf("[imap] config file not found or readable: %s", IMAPConfigFile)
+		}
+
+		cfg, err := parseImapConfig(IMAPConfigFile)
+		if err != nil {
+			return err
+		}
+
+		IMAPConfig = cfg
+
+		if IMAPConfig.BindAddr != "" {
+			IMAPListen = IMAPConfig.BindAddr
+		}
+		if IMAPConfig.TLSCert != "" {
+			IMAPTLSCert = IMAPConfig.TLSCert
+		}
+		if IMAPConfig.TLSKey != "" {
+			IMAPTLSKey = IMAPConfig.TLSKey
+		}
+	}
+
+	if IMAPTLSCert != "" {
+		if strings.HasPrefix(IMAPTLSCert, "sans:") {
+			IMAPTLSCert = snakeoil.Public(IMAPTLSCert)
+		} else {
+			IMAPTLSCert = filepath.Clean(IMAPTLSCert)
+		}
+		if strings.HasPrefix(IMAPTLSKey, "sans:") {
+			IMAPTLSKey = snakeoil.Private(IMAPTLSKey)
+		} else {
+			IMAPTLSKey = filepath.Clean(IMAPTLSKey)
+		}
+
+		if !isFile(IMAPTLSCert) {
+			return fmt.Errorf("[imap] TLS certificate not found or readable: %s", IMAPTLSCert)
+		}
+
+		if !isFile(IMAPTLSKey) {
+			return fmt.Errorf("[imap] TLS key not found or readable: %s", IMAPTLSKey)
+		}
+	}
+	if IMAPTLSCert != "" && IMAPTLSKey == "" || IMAPTLSCert == "" && IMAPTLSKey != "" {
+		return errors.New("[imap] you must provide both an IMAP TLS certificate and a key")
+	}
+	if IMAPConfigFile != "" || IMAPListen != "" {
+		_, err := net.ResolveTCPAddr("tcp", IMAPListen)
+		if err != nil {
+			return fmt.Errorf("[imap] %s", err.Error())
 		}
 	}
 
