@@ -260,6 +260,7 @@ export default {
 				Subject: this.subject,
 				HTML: html,
 				Text: text,
+				Tags: ["outgoing"],
 				Attachments: this.attachments.map((a) => ({
 					Content: a.dataUrl,
 					Filename: a.name,
