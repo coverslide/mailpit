@@ -562,23 +562,23 @@ func openMailbox(name string, user string, readOnly bool) mailbox {
 		ReadOnly:   readOnly,
 	}
 
-	nextUID := uint64(1)
-	for i, m := range messages {
+	for i := len(messages) - 1; i >= 0; i-- {
+		m := messages[i]
 		flags := []string{}
 		if m.Read {
 			flags = append(flags, "\\Seen")
 		}
 		flags = append(flags, m.Tags...)
+		seq := len(messages) - i
 		mb.Messages = append(mb.Messages, imapMessage{
 			ID:    m.ID,
-			UID:   uint64(i + 1),
+			UID:   uint64(seq),
 			Size:  m.Size,
 			Flags: flags,
 			Created: m.Created,
 		})
-		nextUID = uint64(i + 2)
 	}
-	mb.NextUID = nextUID
+	mb.NextUID = uint64(len(messages) + 1)
 	mb.Exists = len(messages)
 	mb.Recent = 0
 	mb.Seen = countSeen(mb.Messages)
@@ -619,9 +619,9 @@ func deleteMarked(mbox mailbox) {
 func expungeMarked(conn net.Conn, mbox **mailbox) {
 	var toDelete []string
 	var newMessages []imapMessage
-	removed := 0
+	var deletedSeqs []int
 
-	for _, m := range (*mbox).Messages {
+	for seq, m := range (*mbox).Messages {
 		marked := false
 		for _, f := range m.Flags {
 			if f == "\\Deleted" {
@@ -631,7 +631,7 @@ func expungeMarked(conn net.Conn, mbox **mailbox) {
 		}
 		if marked {
 			toDelete = append(toDelete, m.ID)
-			removed++
+			deletedSeqs = append(deletedSeqs, seq+1)
 		} else {
 			newMessages = append(newMessages, m)
 		}
@@ -650,8 +650,9 @@ func expungeMarked(conn net.Conn, mbox **mailbox) {
 		(*mbox).Exists = len(newMessages)
 		(*mbox).NextUID = uint64(len(newMessages) + 1)
 
-		for i := 0; i < removed; i++ {
-			sendResponse(conn, fmt.Sprintf("* %d EXPUNGE", len(newMessages)+i+1))
+		// Report EXPUNGE in descending order so sequence numbers remain valid
+		for i := len(deletedSeqs) - 1; i >= 0; i-- {
+			sendResponse(conn, fmt.Sprintf("* %d EXPUNGE", deletedSeqs[i]))
 		}
 	}
 }
@@ -1214,6 +1215,7 @@ func searchBySearchText(mbox mailbox, term string) (map[string]bool, error) {
 }
 
 func searchSince(mbox mailbox, dateStr string) (map[string]bool, error) {
+	dateStr = stripQuotes(dateStr)
 	t, err := time.Parse("02-Jan-2006", dateStr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid date: %s", dateStr)
@@ -1231,6 +1233,7 @@ func searchSince(mbox mailbox, dateStr string) (map[string]bool, error) {
 }
 
 func searchBefore(mbox mailbox, dateStr string) (map[string]bool, error) {
+	dateStr = stripQuotes(dateStr)
 	t, err := time.Parse("02-Jan-2006", dateStr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid date: %s", dateStr)
@@ -1248,6 +1251,7 @@ func searchBefore(mbox mailbox, dateStr string) (map[string]bool, error) {
 }
 
 func searchOn(mbox mailbox, dateStr string) (map[string]bool, error) {
+	dateStr = stripQuotes(dateStr)
 	t, err := time.Parse("02-Jan-2006", dateStr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid date: %s", dateStr)
