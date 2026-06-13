@@ -1,9 +1,10 @@
 package imap
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"net"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -36,6 +37,7 @@ func mboxReply(conn net.Conn, tag, status, msg string) {
 
 func sendFetchResponse(conn net.Conn, seq int, msg imapMessage, attr string) {
 	attr = strings.ToUpper(attr)
+	attr = strings.Trim(attr, "()")
 
 	switch attr {
 	case "FULL":
@@ -76,55 +78,84 @@ func sendFastFetch(conn net.Conn, seq int, msg imapMessage) {
 		seq, flags, internalDate, msg.Size, msg.UID))
 }
 
-func sendCustomFetch(conn net.Conn, seq int, msg imapMessage, attrs string) {
-	var parts []string
+type fetchLiteral struct {
+	tag  string // response attribute tag (e.g., "BODY[]")
+	data []byte // literal data bytes; nil means tag is a plain string
+}
 
-	// Parse parenthesized attribute list
+func sendCustomFetch(conn net.Conn, seq int, msg imapMessage, attrs string) {
 	attrs = strings.Trim(attrs, "()")
 	attrList := splitFetchAttrs(attrs)
 
 	uidIncluded := false
+	var allParts []fetchLiteral
+
 	for _, a := range attrList {
 		a = strings.ToUpper(a)
+		var lit fetchLiteral
 		switch {
 		case a == "FLAGS":
-			parts = append(parts, fmt.Sprintf("FLAGS (%s)", formatFlags(msg.Flags)))
+			lit = fetchLiteral{tag: fmt.Sprintf("FLAGS (%s)", formatFlags(msg.Flags))}
 		case a == "INTERNALDATE":
-			parts = append(parts, fmt.Sprintf("INTERNALDATE %s", formatInternalDate(msg.Created)))
+			lit = fetchLiteral{tag: fmt.Sprintf("INTERNALDATE %s", formatInternalDate(msg.Created))}
 		case a == "RFC822.SIZE":
-			parts = append(parts, fmt.Sprintf("RFC822.SIZE %d", msg.Size))
+			lit = fetchLiteral{tag: fmt.Sprintf("RFC822.SIZE %d", msg.Size)}
 		case a == "UID":
 			uidIncluded = true
-			parts = append(parts, fmt.Sprintf("UID %d", msg.UID))
+			lit = fetchLiteral{tag: fmt.Sprintf("UID %d", msg.UID)}
 		case a == "ENVELOPE":
-			parts = append(parts, fmt.Sprintf("ENVELOPE %s", getEnvelope(msg.ID)))
+			lit = fetchLiteral{tag: fmt.Sprintf("ENVELOPE %s", getEnvelope(msg.ID))}
 		case a == "BODYSTRUCTURE":
-			parts = append(parts, fmt.Sprintf("BODYSTRUCTURE %s", getBodyStructure(msg.ID)))
+			lit = fetchLiteral{tag: fmt.Sprintf("BODYSTRUCTURE %s", getBodyStructure(msg.ID))}
 		case a == "BODY" || strings.HasPrefix(a, "BODY["):
-			bodyPart := getBodyPart(msg.ID, a)
-			parts = append(parts, bodyPart)
+			lit = getBodyPart(msg.ID, a)
 		case a == "BODY.PEEK" || strings.HasPrefix(a, "BODY.PEEK["):
 			peekAttr := strings.Replace(a, "BODY.PEEK", "BODY", 1)
-			bodyPart := getBodyPart(msg.ID, peekAttr)
-			parts = append(parts, bodyPart)
+			lit = getBodyPart(msg.ID, peekAttr)
 		case strings.HasPrefix(a, "RFC822"):
-			bodyPart := getBodyPart(msg.ID, "BODY[]")
-			if a == "RFC822.HEADER" {
-				bodyPart = getBodyPart(msg.ID, "BODY[HEADER]")
-			} else if a == "RFC822.TEXT" {
-				bodyPart = getBodyPart(msg.ID, "BODY[TEXT]")
+			switch a {
+			case "RFC822.HEADER":
+				lit = getBodyPart(msg.ID, "BODY[HEADER]")
+			case "RFC822.TEXT":
+				lit = getBodyPart(msg.ID, "BODY[TEXT]")
+			default:
+				lit = getBodyPart(msg.ID, "BODY[]")
 			}
-			parts = append(parts, bodyPart)
+		}
+		if lit.tag != "" {
+			allParts = append(allParts, lit)
 		}
 	}
 
 	if !uidIncluded {
-		parts = append(parts, fmt.Sprintf("UID %d", msg.UID))
+		allParts = append(allParts, fetchLiteral{tag: fmt.Sprintf("UID %d", msg.UID)})
 	}
 
-	if len(parts) > 0 {
-		sendResponse(conn, fmt.Sprintf("* %d FETCH (%s)", seq, strings.Join(parts, " ")))
+	if len(allParts) == 0 {
+		return
 	}
+
+	// Write FETCH response directly to connection — log summary without binary data
+	logger.Log().Debugf("[imap] fetch response: seq=%d uid=%d", seq, msg.UID)
+	fmt.Fprintf(conn, "* %d FETCH (", seq)
+	first := true
+	for _, p := range allParts {
+		if !first {
+			fmt.Fprintf(conn, " ")
+		}
+		if p.data == nil {
+			fmt.Fprintf(conn, "%s", p.tag)
+		} else {
+			fmt.Fprintf(conn, "%s {%d}\r\n", p.tag, len(p.data))
+			if len(p.data) > 0 {
+				if _, err := conn.Write(p.data); err != nil {
+					return
+				}
+			}
+		}
+		first = false
+	}
+	fmt.Fprintf(conn, ")\r\n")
 }
 
 func formatFlags(flags []string) string {
@@ -198,16 +229,26 @@ func imapQuote(s string) string {
 }
 
 func extractHeader(text, header string) string {
-	re := regexp.MustCompile("(?m)^" + regexp.QuoteMeta(header) + ":\\s*(.*?)(?:\\r?\\n(?:\\s+.*?\\r?\\n)*|$)")
-	match := re.FindStringSubmatch(text)
-	if len(match) < 2 {
-		return ""
+	prefix := header + ":"
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		line = strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(line, prefix) && !strings.HasPrefix(strings.ToUpper(line), strings.ToUpper(prefix)) {
+			continue
+		}
+		var val strings.Builder
+		val.WriteString(strings.TrimSpace(line[len(prefix):]))
+		for j := i + 1; j < len(lines); j++ {
+			cont := strings.TrimRight(lines[j], "\r")
+			if cont == "" || (cont[0] != ' ' && cont[0] != '\t') {
+				break
+			}
+			val.WriteString(" ")
+			val.WriteString(strings.TrimSpace(cont))
+		}
+		return val.String()
 	}
-	value := strings.TrimSpace(match[1])
-	// handle folded headers
-	re2 := regexp.MustCompile(`\r?\n\s+`)
-	value = re2.ReplaceAllString(value, " ")
-	return value
+	return ""
 }
 
 func extractAddresses(text, header string) string {
@@ -284,19 +325,20 @@ func buildBodyStructure(raw []byte) string {
 	mimeType := "text"
 	subType := "plain"
 
+	ctValue := contentType
 	if idx := strings.Index(contentType, ";"); idx >= 0 {
-		contentType = strings.TrimSpace(contentType[:idx])
+		ctValue = strings.TrimSpace(contentType[:idx])
 	}
 
-	if idx := strings.Index(contentType, "/"); idx >= 0 {
-		mimeType = strings.ToLower(strings.TrimSpace(contentType[:idx]))
-		subType = strings.ToLower(strings.TrimSpace(contentType[idx+1:]))
+	if idx := strings.Index(ctValue, "/"); idx >= 0 {
+		mimeType = strings.ToLower(strings.TrimSpace(ctValue[:idx]))
+		subType = strings.ToLower(strings.TrimSpace(ctValue[idx+1:]))
 	} else {
-		mimeType = strings.ToLower(strings.TrimSpace(contentType))
+		mimeType = strings.ToLower(strings.TrimSpace(ctValue))
 		subType = "plain"
 	}
 
-	// Extract Content-Type parameters
+	// Extract Content-Type parameters (excluding boundary for multipart listing)
 	typeParams := extractContentTypeParams(text)
 	contentID := extractHeader(text, "Content-ID")
 	contentDesc := extractHeader(text, "Content-Description")
@@ -305,8 +347,32 @@ func buildBodyStructure(raw []byte) string {
 		contentEncoding = "7bit"
 	}
 
-	bodyLines := countLines(raw)
-	bodyOctets := len(raw)
+	if mimeType == "multipart" {
+		boundary := extractBoundary(text)
+		if boundary != "" {
+			// Find the body (after header/body separator)
+			headerEnd := strings.Index(text, "\r\n\r\n")
+			if headerEnd < 0 {
+				return "NIL"
+			}
+			body := text[headerEnd+4:]
+
+			bodyParts := splitMultipartBody(body, boundary)
+			var children []string
+			for _, part := range bodyParts {
+				children = append(children, buildBodyStructure([]byte(part)))
+			}
+			// Multipart body structure: (children subtype)
+			// Per RFC 3501: (child1 child2 ... "subtype" (params) NIL NIL NIL)
+			return fmt.Sprintf("(%s \"%s\" %s NIL NIL NIL)",
+				strings.Join(children, " "), subType, typeParams)
+		}
+	}
+
+	// Use body-only (strip headers) for octet count and line count per RFC 3501
+	body := bodyFromRaw(raw)
+	bodyLines := countLines(body)
+	bodyOctets := len(body)
 
 	if mimeType == "text" {
 		return fmt.Sprintf("(\"%s\" \"%s\" %s NIL %s %s \"%s\" %d %d NIL NIL NIL)",
@@ -316,24 +382,65 @@ func buildBodyStructure(raw []byte) string {
 			contentEncoding, bodyLines, bodyOctets)
 	}
 
-	if mimeType == "multipart" {
-		boundary := extractBoundary(text)
-		if boundary != "" {
-			bodyParts := splitByBoundary(text, boundary)
-			var children []string
-			for _, part := range bodyParts {
-				children = append(children, buildBodyStructure([]byte(part)))
-			}
-			return fmt.Sprintf("(%s \"%s\" NIL NIL NIL)",
-				strings.Join(children, " "), subType)
-		}
-	}
-
 	return fmt.Sprintf("(\"%s\" \"%s\" %s NIL %s %s \"%s\" %d NIL NIL NIL)",
 		mimeType, subType, typeParams,
 		nilOrString(contentID),
 		nilOrString(contentDesc),
 		contentEncoding, bodyOctets)
+}
+
+// bodyFromRaw returns the body portion (after headers) of a raw message or MIME part.
+func bodyFromRaw(raw []byte) []byte {
+	idx := bytes.Index(raw, []byte("\r\n\r\n"))
+	if idx < 0 {
+		return raw
+	}
+	return raw[idx+4:]
+}
+
+// extractBodyFromText returns the body portion of a text message.
+func extractBodyFromText(text string) string {
+	if idx := strings.Index(text, "\r\n\r\n"); idx >= 0 {
+		return text[idx+4:]
+	}
+	return text
+}
+
+// isMIMEHeader returns true if the field name is a MIME header field.
+func isMIMEHeader(field string) bool {
+	switch strings.ToLower(field) {
+	case "content-type", "content-transfer-encoding", "content-id",
+		"content-description", "content-disposition", "mime-version":
+		return true
+	}
+	return false
+}
+
+// filterMIMEHeaders returns only the MIME header fields from the given raw headers.
+func filterMIMEHeaders(headers string) string {
+	var result []string
+	lines := strings.Split(headers, "\r\n")
+	var inContinuation bool
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		colonIdx := strings.Index(line, ":")
+		if colonIdx < 0 {
+			if inContinuation {
+				result = append(result, line)
+			}
+			continue
+		}
+		fieldName := strings.TrimSpace(line[:colonIdx])
+		if isMIMEHeader(fieldName) {
+			result = append(result, line)
+			inContinuation = true
+		} else {
+			inContinuation = false
+		}
+	}
+	return strings.Join(result, "\r\n")
 }
 
 func extractContentTypeParams(text string) string {
@@ -357,9 +464,9 @@ func extractContentTypeParams(text string) string {
 				}
 				kv := strings.SplitN(p, "=", 2)
 				if len(kv) == 2 {
-					k := strings.TrimSpace(strings.ToLower(kv[0]))
-					v := strings.Trim(strings.TrimSpace(kv[1]), "\"")
-					kvs = append(kvs, fmt.Sprintf("\"%s\" \"%s\"", k, v))
+				k := strings.TrimSpace(strings.ToLower(kv[0]))
+				v := strings.Trim(strings.TrimSpace(kv[1]), "\"")
+				kvs = append(kvs, fmt.Sprintf("\"%s\" %s", k, nilOrString(v)))
 				}
 			}
 			if len(kvs) > 0 {
@@ -467,10 +574,10 @@ func parsePartialRange(attr string) (baseAttr string, offset, size int, hasParti
 	return baseAttr, off, sz, true
 }
 
-func getBodyPart(id, attr string) string {
+func getBodyPart(id, attr string) fetchLiteral {
 	raw, err := storage.GetMessageRaw(id)
 	if err != nil {
-		return "NIL"
+		return fetchLiteral{tag: "NIL"}
 	}
 
 	text := string(raw)
@@ -480,31 +587,46 @@ func getBodyPart(id, attr string) string {
 	// Check for partial range <offset.size>
 	baseAttr, offset, size, isPartial := parsePartialRange(attr)
 
+	// Extract section from baseAttr (e.g., "BODY[1]" → "1")
+	section := extractSection(baseAttr)
+
 	switch {
-	case baseAttr == "BODY[]" || baseAttr == "BODY":
+	case section == "" && (baseAttr == "BODY[]" || baseAttr == "BODY"):
+		// BODY[] or BODY — entire message
 		if isPartial {
 			if offset < 0 {
 				offset = 0
 			}
 			if offset >= len(raw) {
-				return fmt.Sprintf("%s {%d}\r\n", origAttr, 0)
+				return fetchLiteral{tag: fmt.Sprintf("%s {%d}", origAttr, 0), data: []byte{}}
 			}
 			if size < 0 || offset+size > len(raw) {
 				size = len(raw) - offset
 			}
 			sliced := raw[offset : offset+size]
-			return fmt.Sprintf("%s {%d}\r\n%s", origAttr, len(sliced), string(sliced))
+			return fetchLiteral{tag: origAttr, data: sliced}
 		}
-		return fmt.Sprintf("BODY[] {%d}\r\n%s", len(raw), text)
-	case baseAttr == "BODY[HEADER]" || strings.HasPrefix(baseAttr, "BODY[HEADER.FIELDS"):
+		return fetchLiteral{tag: "BODY[]", data: raw}
+
+	case section == "HEADER" || strings.HasPrefix(section, "HEADER.FIELDS"):
+		// BODY[HEADER] or BODY[HEADER.FIELDS (...)]
+		tag, data := getBodyHeader(raw, text, attr)
 		if isPartial {
-			return fmt.Sprintf("%s {%d}\r\n%s", origAttr, 0, "")
+			return fetchLiteral{tag: fmt.Sprintf("%s {%d}", origAttr, 0), data: []byte{}}
 		}
-		return getBodyHeader(raw, text, attr)
-	case baseAttr == "BODY[TEXT]":
+		return fetchLiteral{tag: tag, data: []byte(data)}
+
+	case section == "MIME":
+		// BODY[MIME] — MIME headers of top-level message
+		parts := strings.SplitN(text, "\r\n\r\n", 2)
+		mimeHdrs := filterMIMEHeaders(parts[0])
+		return fetchLiteral{tag: "BODY[MIME]", data: []byte(mimeHdrs + "\r\n")}
+
+	case section == "TEXT":
+		// BODY[TEXT] — body text
 		parts := strings.SplitN(text, "\r\n\r\n", 2)
 		if len(parts) < 2 {
-			return fmt.Sprintf("BODY[TEXT] {%d}\r\n", 0)
+			return fetchLiteral{tag: fmt.Sprintf("BODY[TEXT] {%d}", 0), data: []byte{}}
 		}
 		bodyText := parts[1]
 		if isPartial {
@@ -512,25 +634,54 @@ func getBodyPart(id, attr string) string {
 				offset = 0
 			}
 			if offset >= len(bodyText) {
-				return fmt.Sprintf("%s {%d}\r\n", origAttr, 0)
+				return fetchLiteral{tag: fmt.Sprintf("%s {%d}", origAttr, 0), data: []byte{}}
 			}
 			if size < 0 || offset+size > len(bodyText) {
 				size = len(bodyText) - offset
 			}
 			sliced := bodyText[offset : offset+size]
-			return fmt.Sprintf("%s {%d}\r\n%s", origAttr, len(sliced), sliced)
+			return fetchLiteral{tag: origAttr, data: []byte(sliced)}
 		}
-		return fmt.Sprintf("BODY[TEXT] {%d}\r\n%s", len(bodyText), bodyText)
+		return fetchLiteral{tag: "BODY[TEXT]", data: []byte(bodyText)}
+
+	case isNumericSection(section) || hasNumericPrefix(section):
+		// BODY[1], BODY[2], BODY[1.1], BODY[1.HEADER], BODY[1.TEXT], etc.
+		content, err := getMIMEPartContent(raw, section)
+		if err != nil {
+			return fetchLiteral{tag: fmt.Sprintf("%s NIL", origAttr)}
+		}
+		if isPartial {
+			if offset < 0 {
+				offset = 0
+			}
+			if offset >= len(content) {
+				return fetchLiteral{tag: fmt.Sprintf("%s {%d}", origAttr, 0), data: []byte{}}
+			}
+			if size < 0 || offset+size > len(content) {
+				size = len(content) - offset
+			}
+			sliced := content[offset : offset+size]
+			return fetchLiteral{tag: origAttr, data: sliced}
+		}
+		return fetchLiteral{tag: origAttr, data: content}
+
 	default:
-		return fmt.Sprintf("%s NIL", origAttr)
+		return fetchLiteral{tag: fmt.Sprintf("%s NIL", origAttr)}
 	}
 }
 
-func getBodyHeader(raw []byte, text, attr string) string {
+func getBodyHeader(raw []byte, text, attr string) (string, string) {
 	parts := strings.SplitN(text, "\r\n\r\n", 2)
-	headers := parts[0] + "\r\n"
+	headers := parts[0]
 
-	return fmt.Sprintf("%s {%d}\r\n%s", attr, len(headers), headers)
+	// Filter headers if HEADER.FIELDS or HEADER.FIELDS.NOT
+	if strings.Contains(attr, "HEADER.FIELDS") {
+		headers = filterRequestedHeaders(headers, attr)
+	}
+
+	headers += "\r\n"
+
+	return attr, headers
 }
 
 func splitFetchAttrs(attrs string) []string {
@@ -545,10 +696,10 @@ func splitFetchAttrs(attrs string) []string {
 		case c == '"':
 			inQuote = !inQuote
 			current.WriteByte(c)
-		case c == '(' && !inQuote:
+		case (c == '(' || c == '[') && !inQuote:
 			depth++
 			current.WriteByte(c)
-		case c == ')' && !inQuote:
+		case (c == ')' || c == ']') && !inQuote:
 			depth--
 			current.WriteByte(c)
 		case c == ' ' && !inQuote && depth == 0:
@@ -565,6 +716,267 @@ func splitFetchAttrs(attrs string) []string {
 	}
 
 	return result
+}
+
+// extractSection returns the section specifier inside brackets.
+// "BODY[HEADER]" → "HEADER", "BODY[1]" → "1", "BODY[]" → ""
+func extractSection(attr string) string {
+	start := strings.Index(attr, "[")
+	if start < 0 {
+		return ""
+	}
+	end := strings.LastIndex(attr, "]")
+	if end <= start {
+		return ""
+	}
+	return attr[start+1 : end]
+}
+
+// isNumericSection returns true if the section is a numeric path like "1", "1.2", etc.
+// excluding sub-section keywords HEADER, TEXT, MIME.
+func isNumericSection(section string) bool {
+	if section == "" {
+		return false
+	}
+	parts := strings.Split(section, ".")
+	for _, p := range parts {
+		if p == "HEADER" || p == "TEXT" || p == "MIME" {
+			return false
+		}
+		if _, err := strconv.Atoi(p); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// hasNumericPrefix returns true if the section starts with a number
+// (e.g. "1.HEADER", "1.TEXT", "2.1.MIME").
+func hasNumericPrefix(section string) bool {
+	if section == "" {
+		return false
+	}
+	first := strings.SplitN(section, ".", 2)[0]
+	_, err := strconv.Atoi(first)
+	return err == nil
+}
+
+// getMIMEPartContent extracts content for a MIME part section like "1", "1.2", "1.HEADER", etc.
+func getMIMEPartContent(raw []byte, section string) ([]byte, error) {
+	if section == "" {
+		return raw, nil
+	}
+
+	path := strings.Split(section, ".")
+	current := raw
+
+	for i, step := range path {
+		// Sub-section keywords: HEADER, TEXT, MIME
+		if step == "HEADER" || step == "MIME" {
+			headerEnd := findHeaderEnd(current)
+			if headerEnd < 0 {
+				return current, nil
+			}
+			hdrs := current[:headerEnd]
+			if step == "MIME" {
+				return []byte(filterMIMEHeaders(string(hdrs)) + "\r\n"), nil
+			}
+			return hdrs, nil
+		}
+		if step == "TEXT" {
+			headerEnd := findHeaderEnd(current)
+			if headerEnd < 0 {
+				return nil, errors.New("no body found")
+			}
+			current = current[headerEnd:]
+			continue
+		}
+
+		partNum, err := strconv.Atoi(step)
+		if err != nil {
+			return nil, fmt.Errorf("invalid section number: %s", step)
+		}
+
+		boundary := findBoundary(string(current))
+		if boundary == "" {
+			// Not multipart — only part 1 is valid
+			if partNum != 1 {
+				return nil, errors.New("part not found in non-multipart message")
+			}
+			// Skip to body
+			headerEnd := findHeaderEnd(current)
+			if headerEnd < 0 {
+				return nil, errors.New("no body found")
+			}
+			current = current[headerEnd:]
+			if isLastStep(path, i) {
+				// If no sub-section keyword follows, this is the final section — return the current content as-is
+				return current, nil
+			}
+			continue
+		}
+
+		// Multipart — find the body and split by boundary
+		body := current
+		if hdrEnd := findHeaderEnd(body); hdrEnd >= 0 {
+			body = body[hdrEnd:]
+		}
+
+		parts := splitMultipartBody(string(body), boundary)
+		if partNum < 1 || partNum > len(parts) {
+			return nil, fmt.Errorf("part %d not found", partNum)
+		}
+
+		current = []byte(parts[partNum-1])
+
+		if isLastStep(path, i) {
+			// If the next token in the original section (not path) is HEADER/TEXT/MIME,
+			// it would have been handled above. Since we got here, return as-is.
+			return current, nil
+		}
+	}
+
+	return current, nil
+}
+
+func isLastStep(path []string, i int) bool {
+	return i == len(path)-1
+}
+
+func findHeaderEnd(data []byte) int {
+	idx := bytes.Index(data, []byte("\r\n\r\n"))
+	if idx < 0 {
+		return -1
+	}
+	return idx + 4
+}
+
+// findBoundary extracts the boundary parameter from Content-Type.
+func findBoundary(text string) string {
+	ct := extractHeader(text, "Content-Type")
+	if ct == "" {
+		return ""
+	}
+	return extractBoundaryValue(ct)
+}
+
+func extractBoundaryValue(ct string) string {
+	idx := strings.Index(ct, "boundary=")
+	if idx < 0 {
+		return ""
+	}
+	b := ct[idx+9:]
+	if strings.HasPrefix(b, "\"") {
+		b = strings.Trim(b, "\"")
+	} else {
+		if idx2 := strings.IndexAny(b, " ;"); idx2 > 0 {
+			b = b[:idx2]
+		}
+	}
+	return strings.TrimSpace(b)
+}
+
+// splitMultipartBody splits a multipart body into individual MIME parts,
+// returning each part with its headers.
+func splitMultipartBody(body, boundary string) []string {
+	delim := "--" + boundary
+	parts := strings.Split(body, delim)
+	var result []string
+	for i, part := range parts {
+		// Skip preamble/prologue (first element before first boundary per RFC 2046)
+		if i == 0 {
+			continue
+		}
+		part = strings.TrimLeft(part, "\r\n")
+
+		// Strip trailing -- for closing boundary
+		if strings.HasSuffix(part, "--") {
+			part = strings.TrimSuffix(part, "--")
+		}
+		if strings.HasSuffix(part, "--\r\n") {
+			part = strings.TrimSuffix(part, "--\r\n")
+		}
+
+		part = strings.TrimRight(part, "\r\n")
+		if part != "" && part != "--" && part != "-" {
+			result = append(result, part)
+		}
+	}
+	return result
+}
+
+// filterRequestedHeaders filters headers to return only the requested fields.
+// attr contains the full attribute like BODY[HEADER.FIELDS (DATE FROM)].
+func filterRequestedHeaders(headers, attr string) string {
+	parenStart := strings.Index(attr, "(")
+	parenEnd := strings.LastIndex(attr, ")")
+	if parenStart < 0 || parenEnd <= parenStart {
+		return headers
+	}
+
+	fieldList := attr[parenStart+1 : parenEnd]
+	fields := strings.Fields(fieldList)
+	if len(fields) == 0 {
+		return headers
+	}
+
+	isNot := strings.Contains(attr, "HEADER.FIELDS.NOT")
+
+	var result []string
+	lines := strings.Split(headers, "\r\n")
+	i := 0
+	for i < len(lines) {
+		line := lines[i]
+		if line == "" {
+			i++
+			continue
+		}
+		colonIdx := strings.Index(line, ":")
+		if colonIdx < 0 {
+			// Continuation line (folded header) — include if we're collecting
+			if len(result) > 0 {
+				result = append(result, line)
+			}
+			i++
+			continue
+		}
+
+		fieldName := strings.TrimSpace(line[:colonIdx])
+		matched := false
+		for _, f := range fields {
+			if strings.EqualFold(fieldName, f) {
+				matched = true
+				break
+			}
+		}
+
+		if isNot {
+			if !matched {
+				result = append(result, line)
+				// Include continuation lines
+				i++
+				for i < len(lines) && lines[i] != "" && (lines[i][0] == ' ' || lines[i][0] == '\t') {
+					result = append(result, lines[i])
+					i++
+				}
+				continue
+			}
+		} else {
+			if matched {
+				result = append(result, line)
+				// Include continuation lines
+				i++
+				for i < len(lines) && lines[i] != "" && (lines[i][0] == ' ' || lines[i][0] == '\t') {
+					result = append(result, lines[i])
+					i++
+				}
+				continue
+			}
+		}
+		i++
+	}
+
+	return strings.Join(result, "\r\n")
 }
 
 func parseMessageSet(msgSet string, exists int, uidMode bool, messages []imapMessage) []int {
