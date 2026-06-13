@@ -884,3 +884,160 @@ func GetMetadata(id string) (Metadata, error) {
 	}
 	return meta, nil
 }
+
+// SearchIDsBySearchText returns message IDs where SearchText contains the term.
+func SearchIDsBySearchText(term string) ([]string, error) {
+	if term == "" {
+		return nil, nil
+	}
+	searchTerm := "%" + cleanString(escPercentChar(strings.ToLower(term))) + "%"
+	var ids []string
+
+	q := sqlf.From(tenant("mailbox")).
+		Select("ID").
+		Where("SearchText LIKE ?", searchTerm)
+
+	if err := q.QueryAndClose(context.TODO(), db, func(row *sql.Rows) {
+		var id string
+		if err := row.Scan(&id); err != nil {
+			logger.Log().Errorf("[db] %s", err.Error())
+			return
+		}
+		ids = append(ids, id)
+	}); err != nil {
+		return nil, err
+	}
+
+	dbLastAction = time.Now()
+
+	return ids, nil
+}
+
+// SearchIDsBySubject returns message IDs where Subject contains the term.
+func SearchIDsBySubject(term string) ([]string, error) {
+	if term == "" {
+		return nil, nil
+	}
+	searchTerm := "%" + escPercentChar(term) + "%"
+	var ids []string
+
+	q := sqlf.From(tenant("mailbox")).
+		Select("ID").
+		Where("Subject LIKE ?", searchTerm)
+
+	if err := q.QueryAndClose(context.TODO(), db, func(row *sql.Rows) {
+		var id string
+		if err := row.Scan(&id); err != nil {
+			logger.Log().Errorf("[db] %s", err.Error())
+			return
+		}
+		ids = append(ids, id)
+	}); err != nil {
+		return nil, err
+	}
+
+	dbLastAction = time.Now()
+
+	return ids, nil
+}
+
+// SearchIDsByMetadata returns message IDs where a Metadata JSON field matches.
+// field should be "From", "To", "Cc", "Bcc", or "ReplyTo" (safe, not user-controlled).
+func SearchIDsByMetadata(field, term string) ([]string, error) {
+	if term == "" {
+		return nil, nil
+	}
+	searchTerm := "%" + escPercentChar(strings.ToLower(term)) + "%"
+	var ids []string
+
+	q := sqlf.From(tenant("mailbox")).
+		Select("ID").
+		Where(fmt.Sprintf("json_extract(Metadata, '$.%s') LIKE ?", field), searchTerm)
+
+	if err := q.QueryAndClose(context.TODO(), db, func(row *sql.Rows) {
+		var id string
+		if err := row.Scan(&id); err != nil {
+			logger.Log().Errorf("[db] %s", err.Error())
+			return
+		}
+		ids = append(ids, id)
+	}); err != nil {
+		return nil, err
+	}
+
+	dbLastAction = time.Now()
+
+	return ids, nil
+}
+
+// SearchIDsBySize returns message IDs matching the size comparison.
+func SearchIDsBySize(operator string, size uint64) ([]string, error) {
+	var ids []string
+
+	q := sqlf.From(tenant("mailbox")).
+		Select("ID").
+		Where(fmt.Sprintf("Size %s ?", operator), size)
+
+	if err := q.QueryAndClose(context.TODO(), db, func(row *sql.Rows) {
+		var id string
+		if err := row.Scan(&id); err != nil {
+			logger.Log().Errorf("[db] %s", err.Error())
+			return
+		}
+		ids = append(ids, id)
+	}); err != nil {
+		return nil, err
+	}
+
+	dbLastAction = time.Now()
+
+	return ids, nil
+}
+
+// SearchIDsByCreated returns message IDs matching the Created timestamp comparison.
+func SearchIDsByCreated(operator string, ts int64) ([]string, error) {
+	var ids []string
+
+	q := sqlf.From(tenant("mailbox")).
+		Select("ID").
+		Where(fmt.Sprintf("Created %s ?", operator), ts)
+
+	if err := q.QueryAndClose(context.TODO(), db, func(row *sql.Rows) {
+		var id string
+		if err := row.Scan(&id); err != nil {
+			logger.Log().Errorf("[db] %s", err.Error())
+			return
+		}
+		ids = append(ids, id)
+	}); err != nil {
+		return nil, err
+	}
+
+	dbLastAction = time.Now()
+
+	return ids, nil
+}
+
+// SearchIDsByCreatedBetween returns message IDs where Created is between start and end (inclusive).
+func SearchIDsByCreatedBetween(start, end int64) ([]string, error) {
+	var ids []string
+
+	q := sqlf.From(tenant("mailbox")).
+		Select("ID").
+		Where("Created >= ? AND Created <= ?", start, end)
+
+	if err := q.QueryAndClose(context.TODO(), db, func(row *sql.Rows) {
+		var id string
+		if err := row.Scan(&id); err != nil {
+			logger.Log().Errorf("[db] %s", err.Error())
+			return
+		}
+		ids = append(ids, id)
+	}); err != nil {
+		return nil, err
+	}
+
+	dbLastAction = time.Now()
+
+	return ids, nil
+}

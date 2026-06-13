@@ -6,7 +6,9 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -21,7 +23,7 @@ import (
 
 const (
 	// IMAP capability string
-	imapCapabilities = "IMAP4rev1 LOGIN-REFERRALS AUTH=PLAIN UIDPLUS"
+	imapCapabilities = "IMAP4rev1 LOGIN-REFERRALS AUTH=PLAIN UIDPLUS LITERAL+ NAMESPACE IDLE MOVE CHILDREN"
 )
 
 // Run will start the IMAP server if configured
@@ -112,7 +114,7 @@ func handleClient(conn net.Conn) {
 
 	logger.Log().Debugf("[imap] connection opened by %s", conn.RemoteAddr().String())
 
-	sendResponse(conn, "* OK [CAPABILITY "+imapCapabilities+" CAPABILITY] Mailpit IMAP server")
+	sendResponse(conn, "* OK [CAPABILITY "+imapCapabilities+"] Mailpit IMAP server")
 
 	for {
 		if err := conn.SetReadDeadline(time.Now().Add(timeoutDuration)); err != nil {
@@ -149,7 +151,7 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 
 	switch strings.ToUpper(cmd) {
 	case "CAPABILITY":
-		sendResponse(conn, "* CAPABILITY IMAP4rev1 LOGIN-REFERRALS AUTH=PLAIN UIDPLUS")
+		sendResponse(conn, "* CAPABILITY "+imapCapabilities)
 		sendResponse(conn, tag+" OK CAPABILITY completed")
 	case "NOOP":
 		sendResponse(conn, tag+" OK NOOP completed")
@@ -157,6 +159,51 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 		sendResponse(conn, "* BYE Mailpit IMAP server logging out")
 		sendResponse(conn, tag+" OK LOGOUT completed")
 		return false
+	case "AUTHENTICATE":
+		if *state != stateNotAuthenticated {
+			sendResponse(conn, tag+" BAD already authenticated")
+			return true
+		}
+		if len(args) < 1 || strings.ToUpper(args[0]) != "PLAIN" {
+			sendResponse(conn, tag+` BAD not supported`)
+			return true
+		}
+
+		var authData string
+		if len(args) >= 2 {
+			authData = args[1]
+		} else {
+			sendResponse(conn, "+ ")
+			rawLine, err := reader.ReadString('\n')
+			if err != nil {
+				return false
+			}
+			authData = strings.TrimRight(rawLine, "\r\n")
+		}
+
+		decoded, err := base64.StdEncoding.DecodeString(authData)
+		if err != nil {
+			sendResponse(conn, tag+" NO invalid authentication data")
+			return true
+		}
+
+		parts := strings.SplitN(string(decoded), "\x00", 3)
+		if len(parts) != 3 {
+			sendResponse(conn, tag+" NO invalid authentication data")
+			return true
+		}
+
+		username := parts[1]
+		password := parts[2]
+
+		if authenticateIMAP(username, password) {
+			*state = stateAuthenticated
+			*user = username
+			sendResponse(conn, tag+" OK AUTHENTICATE completed")
+		} else {
+			sendResponse(conn, tag+" NO AUTHENTICATE failed")
+			logger.Log().Warnf("[imap] failed login: %s", username)
+		}
 	case "LOGIN":
 		if *state != stateNotAuthenticated {
 			sendResponse(conn, tag+" BAD already authenticated")
@@ -287,6 +334,24 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 			return true
 		}
 		handleUID(conn, tag, args, mbox)
+	case "NAMESPACE":
+		sendResponse(conn, `* NAMESPACE (("" "/")) NIL NIL`)
+		sendResponse(conn, tag+" OK NAMESPACE completed")
+	case "IDLE":
+		sendResponse(conn, "+ idling")
+	doneLoop:
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				break
+			}
+			line = strings.TrimRight(line, "\r\n")
+			switch strings.ToUpper(line) {
+			case "DONE":
+				break doneLoop
+			}
+		}
+		sendResponse(conn, tag+" OK IDLE completed")
 	case "CHECK":
 		sendResponse(conn, tag+" OK CHECK completed")
 	case "EXPUNGE":
@@ -384,6 +449,8 @@ func authenticateIMAP(username, password string) bool {
 
 	hash := sha256.Sum256([]byte(password))
 	passwordHash := hex.EncodeToString(hash[:])
+
+	logger.Log().Debugf("[imap] password hash for %s: %s (expected: %s)", username, passwordHash, userCfg.PasswordHash)
 
 	if userCfg.PasswordHash != passwordHash {
 		logger.Log().Debugf("[imap] invalid password for user %s", username)
@@ -645,51 +712,262 @@ func removeFlags(existing, remove []string) []string {
 }
 
 func handleSearch(conn net.Conn, tag string, args []string, mbox mailbox) {
-	// Basic SEARCH - if no criteria, return all messages
-	var result []string
-
 	if len(args) == 0 {
+		var result []string
 		for i := range mbox.Messages {
 			result = append(result, strconv.Itoa(i+1))
 		}
-	} else {
-		cmd := strings.ToUpper(args[0])
-		switch cmd {
-		case "ALL":
-			for i := range mbox.Messages {
-				result = append(result, strconv.Itoa(i+1))
-			}
-		case "UNSEEN":
-			for i, m := range mbox.Messages {
-				if !hasFlag(m.Flags, "\\Seen") {
-					result = append(result, strconv.Itoa(i+1))
-				}
-			}
-		case "SEEN":
-			for i, m := range mbox.Messages {
-				if hasFlag(m.Flags, "\\Seen") {
-					result = append(result, strconv.Itoa(i+1))
-				}
-			}
-		case "RECENT":
-			// No recent messages in this implementation
-		case "NEW":
-			for i, m := range mbox.Messages {
-				if !hasFlag(m.Flags, "\\Seen") {
-					result = append(result, strconv.Itoa(i+1))
-				}
-			}
-		default:
-			// If the argument is a number, treat it as a sequence set
-			if id, err := strconv.Atoi(cmd); err == nil {
-				if id >= 1 && id <= len(mbox.Messages) {
-					result = append(result, cmd)
-				}
-			} else if strings.Contains(cmd, ":") {
-				// Range
-				parts := strings.SplitN(cmd, ":", 2)
-				start, _ := strconv.Atoi(parts[0])
-				end, _ := strconv.Atoi(parts[1])
+		sendResponse(conn, "* SEARCH "+strings.Join(result, " "))
+		sendResponse(conn, tag+" OK SEARCH completed")
+		return
+	}
+
+	pos := 0
+	matchingIDs, err := evalSearchKeys(args, &pos, mbox)
+	if err != nil {
+		sendResponse(conn, tag+" BAD search error: "+err.Error())
+		return
+	}
+
+	var result []string
+	for i, m := range mbox.Messages {
+		if matchingIDs[m.ID] {
+			result = append(result, strconv.Itoa(i+1))
+		}
+	}
+
+	sendResponse(conn, "* SEARCH "+strings.Join(result, " "))
+	sendResponse(conn, tag+" OK SEARCH completed")
+}
+
+func evalSearchKeys(args []string, pos *int, mbox mailbox) (map[string]bool, error) {
+	// Start with all message IDs (AND logic - each key narrows down)
+	result := make(map[string]bool)
+	for _, m := range mbox.Messages {
+		result[m.ID] = true
+	}
+
+	for *pos < len(args) {
+		keyResult, err := evalSearchKey(args, pos, mbox)
+		if err != nil {
+			return nil, err
+		}
+		result = intersectMaps(result, keyResult)
+	}
+
+	return result, nil
+}
+
+func evalSearchKey(args []string, pos *int, mbox mailbox) (map[string]bool, error) {
+	if *pos >= len(args) {
+		return nil, errors.New("unexpected end of search criteria")
+	}
+
+	cmd := strings.ToUpper(args[*pos])
+	*pos++
+
+	switch cmd {
+	case "ALL":
+		return allMessageIDs(mbox), nil
+
+	case "CHARSET":
+		// Consume charset argument (e.g., "UTF-8").
+		// We only support UTF-8 implicitly by normalizing to lowercase,
+		// so just skip the charset name and return all messages.
+		if *pos < len(args) {
+			*pos++
+		}
+		return allMessageIDs(mbox), nil
+
+	case "UNSEEN", "NEW":
+		return flagMatch(mbox, "\\Seen", false), nil
+
+	case "SEEN":
+		return flagMatch(mbox, "\\Seen", true), nil
+
+	case "ANSWERED":
+		return flagMatch(mbox, "\\Answered", true), nil
+
+	case "UNANSWERED":
+		return flagMatch(mbox, "\\Answered", false), nil
+
+	case "DELETED":
+		return flagMatch(mbox, "\\Deleted", true), nil
+
+	case "UNDELETED":
+		return flagMatch(mbox, "\\Deleted", false), nil
+
+	case "FLAGGED":
+		return flagMatch(mbox, "\\Flagged", true), nil
+
+	case "UNFLAGGED":
+		return flagMatch(mbox, "\\Flagged", false), nil
+
+	case "DRAFT":
+		return flagMatch(mbox, "\\Draft", true), nil
+
+	case "UNDRAFT":
+		return flagMatch(mbox, "\\Draft", false), nil
+
+	case "RECENT":
+		return make(map[string]bool), nil
+
+	case "OLD":
+		return allMessageIDs(mbox), nil
+
+	case "NOT":
+		inner, err := evalSearchKey(args, pos, mbox)
+		if err != nil {
+			return nil, err
+		}
+		return complementMap(inner, mbox), nil
+
+	case "OR":
+		left, err := evalSearchKey(args, pos, mbox)
+		if err != nil {
+			return nil, err
+		}
+		right, err := evalSearchKey(args, pos, mbox)
+		if err != nil {
+			return nil, err
+		}
+		return unionMaps(left, right), nil
+
+	case "SUBJECT":
+		if *pos >= len(args) {
+			return nil, errors.New("missing argument for SUBJECT")
+		}
+		term := args[*pos]
+		*pos++
+		return searchBySubject(mbox, term)
+
+	case "FROM", "SENDER":
+		if *pos >= len(args) {
+			return nil, errors.New("missing argument for " + cmd)
+		}
+		term := args[*pos]
+		*pos++
+		return searchByMetadata(mbox, "From", term)
+
+	case "TO":
+		if *pos >= len(args) {
+			return nil, errors.New("missing argument for TO")
+		}
+		term := args[*pos]
+		*pos++
+		return searchByMetadata(mbox, "To", term)
+
+	case "CC":
+		if *pos >= len(args) {
+			return nil, errors.New("missing argument for CC")
+		}
+		term := args[*pos]
+		*pos++
+		return searchByMetadata(mbox, "Cc", term)
+
+	case "BCC":
+		if *pos >= len(args) {
+			return nil, errors.New("missing argument for BCC")
+		}
+		term := args[*pos]
+		*pos++
+		return searchByMetadata(mbox, "Bcc", term)
+
+	case "BODY", "TEXT":
+		if *pos >= len(args) {
+			return nil, errors.New("missing argument for " + cmd)
+		}
+		term := args[*pos]
+		*pos++
+		return searchBySearchText(mbox, term)
+
+	case "SINCE", "SENTSINCE":
+		if *pos >= len(args) {
+			return nil, errors.New("missing argument for " + cmd)
+		}
+		dateStr := args[*pos]
+		*pos++
+		return searchSince(mbox, dateStr)
+
+	case "BEFORE", "SENTBEFORE":
+		if *pos >= len(args) {
+			return nil, errors.New("missing argument for " + cmd)
+		}
+		dateStr := args[*pos]
+		*pos++
+		return searchBefore(mbox, dateStr)
+
+	case "ON", "SENTON":
+		if *pos >= len(args) {
+			return nil, errors.New("missing argument for " + cmd)
+		}
+		dateStr := args[*pos]
+		*pos++
+		return searchOn(mbox, dateStr)
+
+	case "SMALLER":
+		if *pos >= len(args) {
+			return nil, errors.New("missing argument for SMALLER")
+		}
+		sizeStr := args[*pos]
+		*pos++
+		return searchSmaller(mbox, sizeStr)
+
+	case "LARGER":
+		if *pos >= len(args) {
+			return nil, errors.New("missing argument for LARGER")
+		}
+		sizeStr := args[*pos]
+		*pos++
+		return searchLarger(mbox, sizeStr)
+
+	case "KEYWORD":
+		if *pos >= len(args) {
+			return nil, errors.New("missing argument for KEYWORD")
+		}
+		flag := args[*pos]
+		*pos++
+		if !strings.HasPrefix(flag, "\\") {
+			flag = "\\" + flag
+		}
+		return flagMatch(mbox, flag, true), nil
+
+	case "UNKEYWORD":
+		if *pos >= len(args) {
+			return nil, errors.New("missing argument for UNKEYWORD")
+		}
+		flag := args[*pos]
+		*pos++
+		if !strings.HasPrefix(flag, "\\") {
+			flag = "\\" + flag
+		}
+		return flagMatch(mbox, flag, false), nil
+
+	case "HEADER":
+		if *pos+1 >= len(args) {
+			return nil, errors.New("missing argument for HEADER")
+		}
+		fieldName := args[*pos]
+		fieldValue := args[*pos+1]
+		*pos += 2
+		return searchHeader(mbox, fieldName, fieldValue)
+
+	case "UID":
+		if *pos >= len(args) {
+			return nil, errors.New("missing argument for UID")
+		}
+		uidStr := args[*pos]
+		*pos++
+		return searchUID(mbox, uidStr)
+
+	default:
+		// Treat as sequence set (single number or range)
+		result := make(map[string]bool)
+		if strings.Contains(cmd, ":") {
+			parts := strings.SplitN(cmd, ":", 2)
+			start, err1 := strconv.Atoi(parts[0])
+			end, err2 := strconv.Atoi(parts[1])
+			if err1 == nil && err2 == nil {
 				if start < 1 {
 					start = 1
 				}
@@ -697,14 +975,225 @@ func handleSearch(conn net.Conn, tag string, args []string, mbox mailbox) {
 					end = len(mbox.Messages)
 				}
 				for i := start; i <= end; i++ {
-					result = append(result, strconv.Itoa(i))
+					result[mbox.Messages[i-1].ID] = true
 				}
 			}
+		} else {
+			if id, err := strconv.Atoi(cmd); err == nil && id >= 1 && id <= len(mbox.Messages) {
+				result[mbox.Messages[id-1].ID] = true
+			}
+		}
+		return result, nil
+	}
+}
+
+func allMessageIDs(mbox mailbox) map[string]bool {
+	result := make(map[string]bool, len(mbox.Messages))
+	for _, m := range mbox.Messages {
+		result[m.ID] = true
+	}
+	return result
+}
+
+func flagMatch(mbox mailbox, flag string, present bool) map[string]bool {
+	result := make(map[string]bool)
+	for _, m := range mbox.Messages {
+		if hasFlag(m.Flags, flag) == present {
+			result[m.ID] = true
 		}
 	}
+	return result
+}
 
-	sendResponse(conn, "* SEARCH "+strings.Join(result, " "))
-	sendResponse(conn, tag+" OK SEARCH completed")
+func intersectMaps(a, b map[string]bool) map[string]bool {
+	result := make(map[string]bool)
+	for k := range a {
+		if b[k] {
+			result[k] = true
+		}
+	}
+	return result
+}
+
+func unionMaps(a, b map[string]bool) map[string]bool {
+	result := make(map[string]bool)
+	for k := range a {
+		result[k] = true
+	}
+	for k := range b {
+		result[k] = true
+	}
+	return result
+}
+
+func complementMap(inner map[string]bool, mbox mailbox) map[string]bool {
+	result := make(map[string]bool)
+	for _, m := range mbox.Messages {
+		if !inner[m.ID] {
+			result[m.ID] = true
+		}
+	}
+	return result
+}
+
+func stripQuotes(s string) string {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+func searchBySubject(mbox mailbox, term string) (map[string]bool, error) {
+	term = stripQuotes(term)
+	ids, err := storage.SearchIDsBySubject(term)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		result[id] = true
+	}
+	return result, nil
+}
+
+func searchByMetadata(mbox mailbox, field, term string) (map[string]bool, error) {
+	term = stripQuotes(term)
+	ids, err := storage.SearchIDsByMetadata(field, term)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		result[id] = true
+	}
+	return result, nil
+}
+
+func searchBySearchText(mbox mailbox, term string) (map[string]bool, error) {
+	term = stripQuotes(term)
+	ids, err := storage.SearchIDsBySearchText(term)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		result[id] = true
+	}
+	return result, nil
+}
+
+func searchSince(mbox mailbox, dateStr string) (map[string]bool, error) {
+	t, err := time.Parse("02-Jan-2006", dateStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid date: %s", dateStr)
+	}
+	ts := t.UnixMilli()
+	ids, err := storage.SearchIDsByCreated(">=", ts)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		result[id] = true
+	}
+	return result, nil
+}
+
+func searchBefore(mbox mailbox, dateStr string) (map[string]bool, error) {
+	t, err := time.Parse("02-Jan-2006", dateStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid date: %s", dateStr)
+	}
+	ts := t.UnixMilli()
+	ids, err := storage.SearchIDsByCreated("<", ts)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		result[id] = true
+	}
+	return result, nil
+}
+
+func searchOn(mbox mailbox, dateStr string) (map[string]bool, error) {
+	t, err := time.Parse("02-Jan-2006", dateStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid date: %s", dateStr)
+	}
+	startOfDay := t.UnixMilli()
+	endOfDay := t.Add(24 * time.Hour).UnixMilli() - 1
+	ids, err := storage.SearchIDsByCreatedBetween(startOfDay, endOfDay)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		result[id] = true
+	}
+	return result, nil
+}
+
+func searchSmaller(mbox mailbox, sizeStr string) (map[string]bool, error) {
+	size, err := strconv.ParseUint(sizeStr, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid size: %s", sizeStr)
+	}
+	ids, err := storage.SearchIDsBySize("<", size)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		result[id] = true
+	}
+	return result, nil
+}
+
+func searchLarger(mbox mailbox, sizeStr string) (map[string]bool, error) {
+	size, err := strconv.ParseUint(sizeStr, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid size: %s", sizeStr)
+	}
+	ids, err := storage.SearchIDsBySize(">", size)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		result[id] = true
+	}
+	return result, nil
+}
+
+func searchHeader(mbox mailbox, fieldName, fieldValue string) (map[string]bool, error) {
+	// Search in SearchText which contains most headers
+	return searchBySearchText(mbox, fieldValue)
+}
+
+func searchUID(mbox mailbox, uidStr string) (map[string]bool, error) {
+	result := make(map[string]bool)
+	if strings.Contains(uidStr, ":") {
+		parts := strings.SplitN(uidStr, ":", 2)
+		start, err1 := strconv.Atoi(parts[0])
+		end, err2 := strconv.Atoi(parts[1])
+		if err1 == nil && err2 == nil {
+			if start < 1 {
+				start = 1
+			}
+			if end > len(mbox.Messages) {
+				end = len(mbox.Messages)
+			}
+			for i := start; i <= end; i++ {
+				result[mbox.Messages[i-1].ID] = true
+			}
+		}
+	} else {
+		if id, err := strconv.Atoi(uidStr); err == nil && id >= 1 && id <= len(mbox.Messages) {
+			result[mbox.Messages[id-1].ID] = true
+		}
+	}
+	return result, nil
 }
 
 func hasFlag(flags []string, flag string) bool {

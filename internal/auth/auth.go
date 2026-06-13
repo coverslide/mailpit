@@ -6,11 +6,15 @@ import (
 	"strings"
 
 	"github.com/tg123/go-htpasswd"
+
+	"github.com/axllent/mailpit/internal/logger"
 )
 
 var (
 	// UICredentials passwords
 	UICredentials *htpasswd.File
+	// UICredentialsRaw is the raw credential string used for debugging
+	UICredentialsRaw string
 	// SendAPICredentials passwords
 	SendAPICredentials *htpasswd.File
 	// SMTPCredentials passwords
@@ -28,9 +32,13 @@ func SetUIAuth(s string) error {
 		return nil
 	}
 
+	UICredentialsRaw = s
+
 	r := strings.NewReader(strings.Join(credentials, "\n"))
 
-	UICredentials, err = htpasswd.NewFromReader(r, htpasswd.DefaultSystems, nil)
+	UICredentials, err = htpasswd.NewFromReader(r, htpasswd.DefaultSystems, func(err error) {
+		logger.Log().Warnf("[auth] credential parsing warning: %s", err.Error())
+	})
 	if err != nil {
 		return err
 	}

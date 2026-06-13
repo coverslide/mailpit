@@ -344,7 +344,11 @@ func middleWareFunc(fn http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 
+			logger.Log().Debugf("[http] basic auth attempt: user=%q", user)
+
 			if !auth.UICredentials.Match(user, pass) {
+				logger.Log().Debugf("[http] basic auth denied for user=%q", user)
+				logger.Log().Debugf("[http] stored credentials: %s", auth.UICredentialsRaw)
 				basicAuthResponse(w)
 				return
 			}
