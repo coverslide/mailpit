@@ -149,6 +149,13 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 		return true
 	}
 
+	// Handle IMAP literals (e.g., {5+}) in arguments
+	for i, arg := range args {
+		if isLiteralPattern(arg) {
+			args[i] = readLiteralData(arg, reader)
+		}
+	}
+
 	switch strings.ToUpper(cmd) {
 	case "CAPABILITY":
 		sendResponse(conn, "* CAPABILITY "+imapCapabilities)
@@ -435,6 +442,36 @@ func splitImapLine(line string) []string {
 	return result
 }
 
+func isLiteralPattern(s string) bool {
+	return len(s) > 2 && s[0] == '{' && s[len(s)-1] == '}'
+}
+
+func readLiteralData(s string, reader *bufio.Reader) string {
+	// Parse {N} or {N+}
+	inner := s[1 : len(s)-1]
+	// Handle optional trailing '+'
+	n, err := strconv.Atoi(inner)
+	if err != nil {
+		if len(inner) > 1 && inner[len(inner)-1] == '+' {
+			n, err = strconv.Atoi(inner[:len(inner)-1])
+		}
+		if err != nil {
+			return s
+		}
+	}
+	if n <= 0 {
+		return ""
+	}
+	if n > 1000000 { // sanity check
+		return s
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(reader, buf); err != nil {
+		return s
+	}
+	return string(buf)
+}
+
 func authenticateIMAP(username, password string) bool {
 	if config.IMAPConfigFile == "" && len(config.IMAPConfig.Users) == 0 {
 		logger.Log().Debugf("[imap] no users configured, rejecting login for %s", username)
@@ -482,6 +519,7 @@ func openMailbox(name string, user string, readOnly bool) mailbox {
 		if m.Read {
 			flags = append(flags, "\\Seen")
 		}
+		flags = append(flags, m.Tags...)
 		mb.Messages = append(mb.Messages, imapMessage{
 			ID:    m.ID,
 			UID:   uint64(i + 1),
@@ -927,10 +965,7 @@ func evalSearchKey(args []string, pos *int, mbox mailbox) (map[string]bool, erro
 		}
 		flag := args[*pos]
 		*pos++
-		if !strings.HasPrefix(flag, "\\") {
-			flag = "\\" + flag
-		}
-		return flagMatch(mbox, flag, true), nil
+		return keywordFlagMatch(mbox, flag, true), nil
 
 	case "UNKEYWORD":
 		if *pos >= len(args) {
@@ -938,10 +973,7 @@ func evalSearchKey(args []string, pos *int, mbox mailbox) (map[string]bool, erro
 		}
 		flag := args[*pos]
 		*pos++
-		if !strings.HasPrefix(flag, "\\") {
-			flag = "\\" + flag
-		}
-		return flagMatch(mbox, flag, false), nil
+		return keywordFlagMatch(mbox, flag, false), nil
 
 	case "HEADER":
 		if *pos+1 >= len(args) {
@@ -999,6 +1031,20 @@ func flagMatch(mbox mailbox, flag string, present bool) map[string]bool {
 	result := make(map[string]bool)
 	for _, m := range mbox.Messages {
 		if hasFlag(m.Flags, flag) == present {
+			result[m.ID] = true
+		}
+	}
+	return result
+}
+
+func keywordFlagMatch(mbox mailbox, flag string, present bool) map[string]bool {
+	result := make(map[string]bool)
+	for _, m := range mbox.Messages {
+		if hasFlag(m.Flags, flag) == present {
+			result[m.ID] = true
+		} else if !strings.HasPrefix(flag, "\\") && hasFlag(m.Flags, "\\"+flag) == present {
+			result[m.ID] = true
+		} else if strings.HasPrefix(flag, "\\") && hasFlag(m.Flags, flag[1:]) == present {
 			result[m.ID] = true
 		}
 	}
