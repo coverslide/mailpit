@@ -156,6 +156,9 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 		}
 	}
 
+	// Merge parenthesized groups (e.g., (FLAGS UID) → single token)
+	args = mergeParenGroups(args)
+
 	switch strings.ToUpper(cmd) {
 	case "CAPABILITY":
 		sendResponse(conn, "* CAPABILITY "+imapCapabilities)
@@ -442,6 +445,51 @@ func splitImapLine(line string) []string {
 	return result
 }
 
+// mergeParenGroups merges arguments that are grouped by parentheses
+// into single tokens. For example, ["FLAGS", "(\\Seen", "\\Flagged)"] becomes
+// ["FLAGS", "(\\Seen \\Flagged)"].
+func mergeParenGroups(args []string) []string {
+	var result []string
+	var parenBuf strings.Builder
+	inParens := false
+	depth := 0
+
+	for _, arg := range args {
+		if !inParens {
+			if strings.HasPrefix(arg, "(") {
+				inParens = true
+				depth = strings.Count(arg, "(") - strings.Count(arg, ")")
+				parenBuf.WriteString(arg)
+				if depth <= 0 {
+					result = append(result, parenBuf.String())
+					parenBuf.Reset()
+					inParens = false
+				}
+			} else {
+				result = append(result, arg)
+			}
+		} else {
+			if parenBuf.Len() > 0 {
+				parenBuf.WriteString(" ")
+			}
+			parenBuf.WriteString(arg)
+			depth += strings.Count(arg, "(") - strings.Count(arg, ")")
+			if depth <= 0 {
+				result = append(result, parenBuf.String())
+				parenBuf.Reset()
+				inParens = false
+			}
+		}
+	}
+
+	// If we still have an unclosed paren group, just add it as-is
+	if inParens {
+		result = append(result, parenBuf.String())
+	}
+
+	return result
+}
+
 func isLiteralPattern(s string) bool {
 	return len(s) > 2 && s[0] == '{' && s[len(s)-1] == '}'
 }
@@ -498,6 +546,7 @@ func authenticateIMAP(username, password string) bool {
 }
 
 func openMailbox(name string, user string, readOnly bool) mailbox {
+	name = strings.Trim(name, "\"")
 	if strings.ToUpper(name) != "INBOX" {
 		return mailbox{}
 	}
@@ -801,8 +850,21 @@ func evalSearchKey(args []string, pos *int, mbox mailbox) (map[string]bool, erro
 		return nil, errors.New("unexpected end of search criteria")
 	}
 
-	cmd := strings.ToUpper(args[*pos])
+	orig := args[*pos]
+	cmd := strings.ToUpper(orig)
 	*pos++
+
+	// Handle parenthesized search key groups: (key1 key2 ...)
+	if strings.HasPrefix(cmd, "(") {
+		if !strings.HasSuffix(cmd, ")") {
+			return nil, errors.New("unclosed parenthesized search key")
+		}
+		inner := orig[1 : len(orig)-1]
+		innerArgs := splitImapLine(inner)
+		innerArgs = mergeParenGroups(innerArgs)
+		innerPos := 0
+		return evalSearchKeys(innerArgs, &innerPos, mbox)
+	}
 
 	switch cmd {
 	case "ALL":
@@ -997,18 +1059,41 @@ func evalSearchKey(args []string, pos *int, mbox mailbox) (map[string]bool, erro
 		result := make(map[string]bool)
 		if strings.Contains(cmd, ":") {
 			parts := strings.SplitN(cmd, ":", 2)
-			start, err1 := strconv.Atoi(parts[0])
-			end, err2 := strconv.Atoi(parts[1])
-			if err1 == nil && err2 == nil {
-				if start < 1 {
-					start = 1
+			startStr := parts[0]
+			endStr := parts[1]
+
+			start := 1
+			end := len(mbox.Messages)
+
+			if startStr != "*" {
+				if n, err := strconv.Atoi(startStr); err == nil && n >= 1 {
+					start = n
+				} else {
+					return result, nil
 				}
-				if end > len(mbox.Messages) {
-					end = len(mbox.Messages)
+			}
+			if endStr != "*" {
+				if n, err := strconv.Atoi(endStr); err == nil && n >= 1 {
+					end = n
+				} else {
+					return result, nil
 				}
-				for i := start; i <= end; i++ {
-					result[mbox.Messages[i-1].ID] = true
-				}
+			}
+			if start > end {
+				start, end = end, start
+			}
+			if start < 1 {
+				start = 1
+			}
+			if end > len(mbox.Messages) {
+				end = len(mbox.Messages)
+			}
+			for i := start; i <= end; i++ {
+				result[mbox.Messages[i-1].ID] = true
+			}
+		} else if cmd == "*" {
+			for _, m := range mbox.Messages {
+				result[m.ID] = true
 			}
 		} else {
 			if id, err := strconv.Atoi(cmd); err == nil && id >= 1 && id <= len(mbox.Messages) {
@@ -1219,23 +1304,48 @@ func searchHeader(mbox mailbox, fieldName, fieldValue string) (map[string]bool, 
 
 func searchUID(mbox mailbox, uidStr string) (map[string]bool, error) {
 	result := make(map[string]bool)
+	maxUID := len(mbox.Messages)
+
 	if strings.Contains(uidStr, ":") {
 		parts := strings.SplitN(uidStr, ":", 2)
-		start, err1 := strconv.Atoi(parts[0])
-		end, err2 := strconv.Atoi(parts[1])
-		if err1 == nil && err2 == nil {
-			if start < 1 {
-				start = 1
-			}
-			if end > len(mbox.Messages) {
-				end = len(mbox.Messages)
-			}
-			for i := start; i <= end; i++ {
-				result[mbox.Messages[i-1].ID] = true
+		startStr := strings.TrimSpace(parts[0])
+		endStr := strings.TrimSpace(parts[1])
+
+		start := 1
+		end := maxUID
+
+		if startStr != "*" {
+			if n, err := strconv.Atoi(startStr); err == nil && n >= 1 {
+				start = n
+			} else {
+				return result, nil
 			}
 		}
+		if endStr != "*" {
+			if n, err := strconv.Atoi(endStr); err == nil && n >= 1 {
+				end = n
+			} else {
+				return result, nil
+			}
+		}
+		if start > end {
+			start, end = end, start
+		}
+		if start < 1 {
+			start = 1
+		}
+		if end > maxUID {
+			end = maxUID
+		}
+		for i := start; i <= end; i++ {
+			result[mbox.Messages[i-1].ID] = true
+		}
+	} else if uidStr == "*" {
+		for _, m := range mbox.Messages {
+			result[m.ID] = true
+		}
 	} else {
-		if id, err := strconv.Atoi(uidStr); err == nil && id >= 1 && id <= len(mbox.Messages) {
+		if id, err := strconv.Atoi(uidStr); err == nil && id >= 1 && id <= maxUID {
 			result[mbox.Messages[id-1].ID] = true
 		}
 	}

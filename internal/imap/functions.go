@@ -425,6 +425,48 @@ func countLines(raw []byte) int {
 	return count
 }
 
+// parsePartialRange extracts the <offset.size> suffix from a BODY attribute.
+// Returns the base attribute (without the partial specifier) and the offset and size.
+func parsePartialRange(attr string) (baseAttr string, offset, size int, hasPartial bool) {
+	startIdx := strings.LastIndex(attr, "<")
+	endIdx := strings.LastIndex(attr, ">")
+	if startIdx < 0 || endIdx <= startIdx {
+		return attr, 0, 0, false
+	}
+	rangeStr := attr[startIdx+1 : endIdx]
+	baseAttr = attr[:startIdx]
+
+	dotIdx := strings.Index(rangeStr, ".")
+	if dotIdx < 0 {
+		// <offset> only — no dot, size means rest
+		off, err := strconv.Atoi(rangeStr)
+		if err != nil {
+			return attr, 0, 0, false
+		}
+		return baseAttr, off, -1, true
+	}
+
+	offStr := rangeStr[:dotIdx]
+	sizeStr := rangeStr[dotIdx+1:]
+
+	off, err := strconv.Atoi(offStr)
+	if err != nil {
+		return attr, 0, 0, false
+	}
+
+	if sizeStr == "" {
+		// <offset.> — read to end
+		return baseAttr, off, -1, true
+	}
+
+	sz, err := strconv.Atoi(sizeStr)
+	if err != nil {
+		return attr, 0, 0, false
+	}
+
+	return baseAttr, off, sz, true
+}
+
 func getBodyPart(id, attr string) string {
 	raw, err := storage.GetMessageRaw(id)
 	if err != nil {
@@ -432,23 +474,55 @@ func getBodyPart(id, attr string) string {
 	}
 
 	text := string(raw)
+	origAttr := attr
 	attr = strings.ToUpper(attr)
 
+	// Check for partial range <offset.size>
+	baseAttr, offset, size, isPartial := parsePartialRange(attr)
+
 	switch {
-	case attr == "BODY[]" || attr == "BODY":
-		// literal format
+	case baseAttr == "BODY[]" || baseAttr == "BODY":
+		if isPartial {
+			if offset < 0 {
+				offset = 0
+			}
+			if offset >= len(raw) {
+				return fmt.Sprintf("%s {%d}\r\n", origAttr, 0)
+			}
+			if size < 0 || offset+size > len(raw) {
+				size = len(raw) - offset
+			}
+			sliced := raw[offset : offset+size]
+			return fmt.Sprintf("%s {%d}\r\n%s", origAttr, len(sliced), string(sliced))
+		}
 		return fmt.Sprintf("BODY[] {%d}\r\n%s", len(raw), text)
-	case attr == "BODY[HEADER]" || attr == "BODY[HEADER.FIELDS":
+	case baseAttr == "BODY[HEADER]" || strings.HasPrefix(baseAttr, "BODY[HEADER.FIELDS"):
+		if isPartial {
+			return fmt.Sprintf("%s {%d}\r\n%s", origAttr, 0, "")
+		}
 		return getBodyHeader(raw, text, attr)
-	case attr == "BODY[TEXT]":
+	case baseAttr == "BODY[TEXT]":
 		parts := strings.SplitN(text, "\r\n\r\n", 2)
 		if len(parts) < 2 {
 			return fmt.Sprintf("BODY[TEXT] {%d}\r\n", 0)
 		}
 		bodyText := parts[1]
+		if isPartial {
+			if offset < 0 {
+				offset = 0
+			}
+			if offset >= len(bodyText) {
+				return fmt.Sprintf("%s {%d}\r\n", origAttr, 0)
+			}
+			if size < 0 || offset+size > len(bodyText) {
+				size = len(bodyText) - offset
+			}
+			sliced := bodyText[offset : offset+size]
+			return fmt.Sprintf("%s {%d}\r\n%s", origAttr, len(sliced), sliced)
+		}
 		return fmt.Sprintf("BODY[TEXT] {%d}\r\n%s", len(bodyText), bodyText)
 	default:
-		return fmt.Sprintf("%s NIL", attr)
+		return fmt.Sprintf("%s NIL", origAttr)
 	}
 }
 
@@ -456,7 +530,7 @@ func getBodyHeader(raw []byte, text, attr string) string {
 	parts := strings.SplitN(text, "\r\n\r\n", 2)
 	headers := parts[0] + "\r\n"
 
-	return fmt.Sprintf("BODY[HEADER] {%d}\r\n%s", len(headers), headers)
+	return fmt.Sprintf("%s {%d}\r\n%s", attr, len(headers), headers)
 }
 
 func splitFetchAttrs(attrs string) []string {
