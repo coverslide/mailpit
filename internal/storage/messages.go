@@ -30,8 +30,17 @@ import (
 
 // Store will save an email to the database tables.
 // The username is the authentication username of either the SMTP or HTTP client (blank for none).
+// The folder is the IMAP folder to store the message in (empty string for INBOX, "Sent", "Trash", "Drafts").
 // Returns the database ID of the saved message.
-func Store(body *[]byte, username *string) (string, error) {
+func Store(body *[]byte, username *string, placement ...string) (string, error) {
+	folder := ""
+	if len(placement) > 0 {
+		folder = placement[0]
+	}
+	var userID []string
+	if len(placement) > 1 {
+		userID = placement[1:]
+	}
 	// Parse message body with enmime
 	env, err := storeParser.ReadEnvelope(bytes.NewReader(*body))
 	if err != nil {
@@ -103,13 +112,17 @@ func Store(body *[]byte, username *string) (string, error) {
 	attachments := len(env.Attachments)
 
 	sql := fmt.Sprintf(`INSERT INTO %s
-    	(Created, ID, MessageID, Subject, Metadata, Size, Inline, Attachments, SearchText, MetaSearchText, Read, Snippet)
-	    VALUES(?,?,?,?,?,?,?,?,?,?,0,?)`,
+	(Created, ID, MessageID, Subject, Metadata, Size, Inline, Attachments, SearchText, MetaSearchText, Read, Snippet, Folder, UserID)
+	    VALUES(?,?,?,?,?,?,?,?,?,?,0,?,?,?)`,
 		tenant("mailbox"),
 	) // #nosec
 
 	// insert mail summary data
-	_, err = tx.Exec(sql, created.UnixMilli(), id, messageID, subject, string(summaryJSON), size, inline, attachments, searchText, metaSearchText, snippet)
+	uid := ""
+	if len(userID) > 0 {
+		uid = userID[0]
+	}
+	_, err = tx.Exec(sql, created.UnixMilli(), id, messageID, subject, string(summaryJSON), size, inline, attachments, searchText, metaSearchText, snippet, folder, uid)
 	if err != nil {
 		return "", err
 	}
@@ -225,20 +238,57 @@ func Store(body *[]byte, username *string) (string, error) {
 
 	BroadcastMailboxStats()
 
+	// Notify IDLEing IMAP clients about the new message in the target folder.
+	uid = ""
+	if len(userID) > 0 {
+		uid = userID[0]
+	}
+	if uid != "" {
+		// Per-user notification: only notify connections for this specific user.
+		if total, _, _, err := MailboxCounts(folder, uid); err == nil {
+			IdleNotify.NotifyFolderChangeUser(uid, folder, int(total))
+		}
+	} else {
+		// Shared message: notify all IDLEing connections.
+		if total, _, _, err := MailboxCounts(folder); err == nil {
+			IdleNotify.NotifyFolderChange(folder, int(total))
+		}
+	}
+
 	logger.Log().Debugf("[db] saved message %s (%d bytes)", id, size)
 
 	return id, nil
 }
 
+// UpdateCreated overrides the Created timestamp for a stored message.
+// Used by IMAP APPEND to preserve the client-provided date-time.
+func UpdateCreated(id string, t time.Time) error {
+	q := fmt.Sprintf("UPDATE %s SET Created = ? WHERE ID = ?", tenant("mailbox"))
+	_, err := db.Exec(q, t.UnixMilli(), id)
+	return err
+}
+
 // List returns a subset of messages from the mailbox,
-// sorted latest to oldest
-func List(start int, beforeTS int64, limit int) ([]MessageSummary, error) {
+// sorted latest to oldest.
+// Pass folder="" for INBOX (default), "Sent", "Trash", or "Drafts".
+func List(start int, beforeTS int64, limit int, folder string, userID ...string) ([]MessageSummary, error) {
 	results := []MessageSummary{}
 	tsStart := time.Now()
 
 	q := sqlf.From(tenant("mailbox") + " m").
 		Select(`m.Created, m.ID, m.MessageID, m.Subject, m.Metadata, m.Size, m.Attachments, m.Read, m.Snippet`).
-		OrderBy("m.Created DESC")
+		OrderBy("m.Created DESC, m.rowid DESC")
+
+	if folder != "" {
+		q = q.Where("m.Folder = ?", folder)
+	} else {
+		q = q.Where("m.Folder = ''")
+	}
+
+	// Per-user inbox filtering: show only messages owned by this user.
+	if len(userID) > 0 && userID[0] != "" {
+		q = q.Where("m.UserID = ?", userID[0])
+	}
 
 	if limit > 0 {
 		q = q.Limit(limit).Offset(start)
@@ -320,6 +370,41 @@ func List(start int, beforeTS int64, limit int) ([]MessageSummary, error) {
 	logger.Log().Debugf("[db] list INBOX in %s", elapsed)
 
 	return results, nil
+}
+
+// MailboxCounts returns the total, unread, and next UID for a folder.
+// Pass folder="" for INBOX.
+func MailboxCounts(folder string, userID ...string) (total, unread, nextUID int64, err error) {
+	var totalF, unreadF float64
+
+	q := sqlf.From(tenant("mailbox")).Select("COUNT(*)").To(&totalF)
+	if folder != "" {
+		q = q.Where("Folder = ?", folder)
+	} else {
+		q = q.Where("Folder = ''")
+	}
+	if len(userID) > 0 && userID[0] != "" {
+		q = q.Where("UserID = ?", userID[0])
+	}
+	if err = q.QueryRowAndClose(context.TODO(), db); err != nil {
+		return 0, 0, 1, err
+	}
+
+	q2 := sqlf.From(tenant("mailbox")).Select("COUNT(*)").To(&unreadF).
+		Where("Read = ?", 0)
+	if folder != "" {
+		q2 = q2.Where("Folder = ?", folder)
+	} else {
+		q2 = q2.Where("Folder = ''")
+	}
+	if len(userID) > 0 && userID[0] != "" {
+		q2 = q2.Where("UserID = ?", userID[0])
+	}
+	if err = q2.QueryRowAndClose(context.TODO(), db); err != nil {
+		return 0, 0, 1, err
+	}
+
+	return int64(totalF), int64(unreadF), int64(totalF) + 1, nil
 }
 
 // GetMessage returns a Message generated from the mailbox_data collection.
@@ -547,7 +632,7 @@ func LatestID(r *http.Request) (string, error) {
 			return "", err
 		}
 	} else {
-		messages, err = List(0, 0, 1)
+		messages, err = List(0, 0, 1, "")
 		if err != nil {
 			return "", err
 		}
@@ -719,10 +804,16 @@ func DeleteMessages(ids []string) error {
 
 	toDelete := []string{}
 	var totalSize uint64
+	// Track affected folders per user for IDLE notifications.
+	type folderUser struct {
+		folder string
+		user   string
+	}
+	foldersAffected := make(map[folderUser]bool)
 
 	// only the messages which exist are counted, and a long list is looked up in parts
 	for _, chunk := range chunkBy(ids, maxSQLVariables) {
-		sql := fmt.Sprintf(`SELECT ID, Size FROM %s WHERE ID IN %s`, tenant("mailbox"), inPlaceholders(len(chunk))) // #nosec
+		sql := fmt.Sprintf(`SELECT ID, Size, Folder, UserID FROM %s WHERE ID IN %s`, tenant("mailbox"), inPlaceholders(len(chunk))) // #nosec
 		rows, err := db.Query(sql, idArgs(chunk)...)
 		if err != nil {
 			return err
@@ -731,14 +822,17 @@ func DeleteMessages(ids []string) error {
 		for rows.Next() {
 			var id string
 			var size float64 // use float64 for rqlite compatibility
+			var folder string
+			var userID string
 
-			if err := rows.Scan(&id, &size); err != nil {
+			if err := rows.Scan(&id, &size, &folder, &userID); err != nil {
 				_ = rows.Close()
 				return err
 			}
 
 			toDelete = append(toDelete, id)
 			totalSize = totalSize + uint64(size)
+			foldersAffected[folderUser{folder, userID}] = true
 		}
 
 		err = rows.Err()
@@ -806,6 +900,71 @@ func DeleteMessages(ids []string) error {
 		websockets.Broadcast("delete", d)
 	}
 
+	// Notify IDLEing IMAP clients about the deletions in affected folders.
+	for fu := range foldersAffected {
+		if fu.user != "" {
+			if total, _, _, err := MailboxCounts(fu.folder, fu.user); err == nil {
+				IdleNotify.NotifyFolderChangeUser(fu.user, fu.folder, int(total))
+			}
+		} else {
+			if total, _, _, err := MailboxCounts(fu.folder); err == nil {
+				IdleNotify.NotifyFolderChange(fu.folder, int(total))
+			}
+		}
+	}
+
+	return nil
+}
+
+// MoveMessage changes the Folder of a message by ID.
+// This is used by IMAP MOVE to atomically move a message between folders
+// without creating a duplicate.
+func MoveMessage(id, folder string) error {
+	if id == "" {
+		return fmt.Errorf("message ID cannot be empty")
+	}
+	ctx := context.Background()
+
+	// Look up the current folder and user before moving, so we can notify both sides.
+	var oldFolder, msgUserID string
+	err := db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT Folder, UserID FROM %s WHERE ID = ?`, tenant("mailbox")),
+		id,
+	).Scan(&oldFolder, &msgUserID)
+	if err != nil {
+		return err
+	}
+
+	_, err = db.ExecContext(ctx,
+		fmt.Sprintf(`UPDATE %s SET Folder = ? WHERE ID = ?`, tenant("mailbox")),
+		folder, id,
+	)
+	if err != nil {
+		return err
+	}
+	dbLastAction.touch()
+
+	// Notify IDLEing clients on both source and destination folders.
+	if oldFolder != folder {
+		if msgUserID != "" {
+			// Per-user notification.
+			if oldTotal, _, _, err := MailboxCounts(oldFolder, msgUserID); err == nil {
+				IdleNotify.NotifyFolderChangeUser(msgUserID, oldFolder, int(oldTotal))
+			}
+			if newTotal, _, _, err := MailboxCounts(folder, msgUserID); err == nil {
+				IdleNotify.NotifyFolderChangeUser(msgUserID, folder, int(newTotal))
+			}
+		} else {
+			// Shared message: notify all.
+			if oldTotal, _, _, err := MailboxCounts(oldFolder); err == nil {
+				IdleNotify.NotifyFolderChange(oldFolder, int(oldTotal))
+			}
+			if newTotal, _, _, err := MailboxCounts(folder); err == nil {
+				IdleNotify.NotifyFolderChange(folder, int(newTotal))
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -862,6 +1021,9 @@ func DeleteAllMessages() error {
 
 	websockets.Broadcast("truncate", nil)
 
+	// Notify IDLEing IMAP clients that INBOX is now empty.
+	IdleNotify.NotifyFolderChange("", 0)
+
 	return err
 }
 
@@ -880,17 +1042,21 @@ func GetMetadata(id string) (Metadata, error) {
 }
 
 // SearchIDsBySearchText returns message IDs where SearchText contains the term.
-func SearchIDsBySearchText(term string) ([]string, error) {
+func SearchIDsBySearchText(term string, userID ...string) ([]string, error) {
 	if term == "" {
 		return nil, nil
 	}
-	searchTerm := "%" + cleanString(escPercentChar(strings.ToLower(term))) + "%"
+	searchTerm := "%" + cleanString(escLikeChars(strings.ToLower(term))) + "%"
 	var ids []string
 
 	q := sqlf.From(tenant("mailbox")).
 		Select("ID").
 		Where("SearchText LIKE ?", searchTerm)
 
+	if len(userID) > 0 && userID[0] != "" {
+		q = q.Where("UserID = ?", userID[0])
+	}
+
 	if err := q.QueryAndClose(context.TODO(), db, func(row *sql.Rows) {
 		var id string
 		if err := row.Scan(&id); err != nil {
@@ -902,23 +1068,27 @@ func SearchIDsBySearchText(term string) ([]string, error) {
 		return nil, err
 	}
 
-	dbLastAction = time.Now()
+	dbLastAction.touch()
 
 	return ids, nil
 }
 
 // SearchIDsBySubject returns message IDs where Subject contains the term.
-func SearchIDsBySubject(term string) ([]string, error) {
+func SearchIDsBySubject(term string, userID ...string) ([]string, error) {
 	if term == "" {
 		return nil, nil
 	}
-	searchTerm := "%" + escPercentChar(term) + "%"
+	searchTerm := "%" + escLikeChars(term) + "%"
 	var ids []string
 
 	q := sqlf.From(tenant("mailbox")).
 		Select("ID").
 		Where("Subject LIKE ?", searchTerm)
 
+	if len(userID) > 0 && userID[0] != "" {
+		q = q.Where("UserID = ?", userID[0])
+	}
+
 	if err := q.QueryAndClose(context.TODO(), db, func(row *sql.Rows) {
 		var id string
 		if err := row.Scan(&id); err != nil {
@@ -930,24 +1100,28 @@ func SearchIDsBySubject(term string) ([]string, error) {
 		return nil, err
 	}
 
-	dbLastAction = time.Now()
+	dbLastAction.touch()
 
 	return ids, nil
 }
 
 // SearchIDsByMetadata returns message IDs where a Metadata JSON field matches.
 // field should be "From", "To", "Cc", "Bcc", or "ReplyTo" (safe, not user-controlled).
-func SearchIDsByMetadata(field, term string) ([]string, error) {
+func SearchIDsByMetadata(field, term string, userID ...string) ([]string, error) {
 	if term == "" {
 		return nil, nil
 	}
-	searchTerm := "%" + escPercentChar(strings.ToLower(term)) + "%"
+	searchTerm := "%" + escLikeChars(strings.ToLower(term)) + "%"
 	var ids []string
 
 	q := sqlf.From(tenant("mailbox")).
 		Select("ID").
 		Where(fmt.Sprintf("json_extract(Metadata, '$.%s') LIKE ?", field), searchTerm)
 
+	if len(userID) > 0 && userID[0] != "" {
+		q = q.Where("UserID = ?", userID[0])
+	}
+
 	if err := q.QueryAndClose(context.TODO(), db, func(row *sql.Rows) {
 		var id string
 		if err := row.Scan(&id); err != nil {
@@ -959,19 +1133,23 @@ func SearchIDsByMetadata(field, term string) ([]string, error) {
 		return nil, err
 	}
 
-	dbLastAction = time.Now()
+	dbLastAction.touch()
 
 	return ids, nil
 }
 
 // SearchIDsBySize returns message IDs matching the size comparison.
-func SearchIDsBySize(operator string, size uint64) ([]string, error) {
+func SearchIDsBySize(operator string, size uint64, userID ...string) ([]string, error) {
 	var ids []string
 
 	q := sqlf.From(tenant("mailbox")).
 		Select("ID").
 		Where(fmt.Sprintf("Size %s ?", operator), size)
 
+	if len(userID) > 0 && userID[0] != "" {
+		q = q.Where("UserID = ?", userID[0])
+	}
+
 	if err := q.QueryAndClose(context.TODO(), db, func(row *sql.Rows) {
 		var id string
 		if err := row.Scan(&id); err != nil {
@@ -983,19 +1161,23 @@ func SearchIDsBySize(operator string, size uint64) ([]string, error) {
 		return nil, err
 	}
 
-	dbLastAction = time.Now()
+	dbLastAction.touch()
 
 	return ids, nil
 }
 
 // SearchIDsByCreated returns message IDs matching the Created timestamp comparison.
-func SearchIDsByCreated(operator string, ts int64) ([]string, error) {
+func SearchIDsByCreated(operator string, ts int64, userID ...string) ([]string, error) {
 	var ids []string
 
 	q := sqlf.From(tenant("mailbox")).
 		Select("ID").
 		Where(fmt.Sprintf("Created %s ?", operator), ts)
 
+	if len(userID) > 0 && userID[0] != "" {
+		q = q.Where("UserID = ?", userID[0])
+	}
+
 	if err := q.QueryAndClose(context.TODO(), db, func(row *sql.Rows) {
 		var id string
 		if err := row.Scan(&id); err != nil {
@@ -1007,19 +1189,23 @@ func SearchIDsByCreated(operator string, ts int64) ([]string, error) {
 		return nil, err
 	}
 
-	dbLastAction = time.Now()
+	dbLastAction.touch()
 
 	return ids, nil
 }
 
 // SearchIDsByCreatedBetween returns message IDs where Created is between start and end (inclusive).
-func SearchIDsByCreatedBetween(start, end int64) ([]string, error) {
+func SearchIDsByCreatedBetween(start, end int64, userID ...string) ([]string, error) {
 	var ids []string
 
 	q := sqlf.From(tenant("mailbox")).
 		Select("ID").
 		Where("Created >= ? AND Created <= ?", start, end)
 
+	if len(userID) > 0 && userID[0] != "" {
+		q = q.Where("UserID = ?", userID[0])
+	}
+
 	if err := q.QueryAndClose(context.TODO(), db, func(row *sql.Rows) {
 		var id string
 		if err := row.Scan(&id); err != nil {
@@ -1031,7 +1217,7 @@ func SearchIDsByCreatedBetween(start, end int64) ([]string, error) {
 		return nil, err
 	}
 
-	dbLastAction = time.Now()
+	dbLastAction.touch()
 
 	return ids, nil
 }

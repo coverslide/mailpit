@@ -22,7 +22,7 @@ func RedirectToLatestMessage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		messages, err = storage.List(0, 0, 1)
+		messages, err = storage.List(0, 0, 1, "")
 		if err != nil {
 			httpError(w, err.Error())
 			return

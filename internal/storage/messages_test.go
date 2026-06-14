@@ -18,7 +18,7 @@ func TestTextEmailInserts(t *testing.T) {
 	start := time.Now()
 
 	for range testRuns {
-		if _, err := Store(&testTextEmail, nil); err != nil {
+		if _, err := Store(&testTextEmail, nil, ""); err != nil {
 			t.Log("error ", err)
 			t.Fail()
 		}
@@ -56,7 +56,7 @@ func TestMimeEmailInserts(t *testing.T) {
 		start := time.Now()
 
 		for range testRuns {
-			if _, err := Store(&testMimeEmail, nil); err != nil {
+			if _, err := Store(&testMimeEmail, nil, ""); err != nil {
 				t.Log("error ", err)
 				t.Fail()
 			}
@@ -96,7 +96,7 @@ func TestRetrieveMimeEmail(t *testing.T) {
 				t.Logf("Testing mime email retrieval (tenant %s)", tenantID)
 			}
 
-			id, err := Store(&testMimeEmail, nil)
+			id, err := Store(&testMimeEmail, nil, "")
 			if err != nil {
 				t.Log("error ", err)
 				t.Fail()
@@ -153,12 +153,12 @@ func TestMessageSummary(t *testing.T) {
 			t.Logf("Testing message summary (tenant %s)", tenantID)
 		}
 
-		if _, err := Store(&testMimeEmail, nil); err != nil {
+		if _, err := Store(&testMimeEmail, nil, ""); err != nil {
 			t.Log("error ", err)
 			t.Fail()
 		}
 
-		summaries, err := List(0, 0, 1)
+		summaries, err := List(0, 0, 1, "")
 		if err != nil {
 			t.Log("error ", err)
 			t.Fail()
@@ -186,8 +186,8 @@ func BenchmarkImportText(b *testing.B) {
 	setup("")
 	defer Close()
 
-	for b.Loop() {
-		if _, err := Store(&testTextEmail, nil); err != nil {
+	for i := 0; i < b.N; i++ {
+		if _, err := Store(&testTextEmail, nil, ""); err != nil {
 			b.Log("error ", err)
 			b.Fail()
 		}
@@ -198,8 +198,8 @@ func BenchmarkImportMime(b *testing.B) {
 	setup("")
 	defer Close()
 
-	for b.Loop() {
-		if _, err := Store(&testMimeEmail, nil); err != nil {
+	for i := 0; i < b.N; i++ {
+		if _, err := Store(&testMimeEmail, nil, ""); err != nil {
 			b.Log("error ", err)
 			b.Fail()
 		}
@@ -216,7 +216,7 @@ func TestInlineImageContentIdHandling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to read test email: %v", err)
 	}
-	storedMessage, err := Store(&inlineAttachment, nil)
+	storedMessage, err := Store(&inlineAttachment, nil, "")
 	if err != nil {
 		t.Fatal("Failed to store test case 1:", err)
 	}
@@ -246,7 +246,7 @@ func TestRegularAttachmentHandling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to read test email: %v", err)
 	}
-	storedMessage, err := Store(&regularAttachment, nil)
+	storedMessage, err := Store(&regularAttachment, nil, "")
 	if err != nil {
 		t.Fatal("Failed to store test case 3:", err)
 	}
@@ -280,7 +280,7 @@ func TestMixedAttachmentHandling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to read test email: %v", err)
 	}
-	storedMessage, err := Store(&mixedAttachment, nil)
+	storedMessage, err := Store(&mixedAttachment, nil, "")
 	if err != nil {
 		t.Fatal("Failed to store test case 4:", err)
 	}
@@ -303,28 +303,322 @@ func TestMixedAttachmentHandling(t *testing.T) {
 	}
 }
 
+func TestMailboxCounts(t *testing.T) {
+	setup("")
+	defer Close()
+
+	body := []byte("From: a@b.com\r\nTo: c@d.com\r\nSubject: one\r\n\r\nbody")
+	if _, err := Store(&body, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	body2 := []byte("From: a@b.com\r\nTo: c@d.com\r\nSubject: two\r\n\r\nbody")
+	if _, err := Store(&body2, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	total, unread, nextUID, err := MailboxCounts("")
+	if err != nil {
+		t.Fatalf("MailboxCounts error: %v", err)
+	}
+	if total != 2 {
+		t.Errorf("expected total 2, got %d", total)
+	}
+	if unread != 2 {
+		t.Errorf("expected unread 2, got %d", unread)
+	}
+	if nextUID != 3 {
+		t.Errorf("expected nextUID 3, got %d", nextUID)
+	}
+}
+
+func TestMailboxCountsWithUserID(t *testing.T) {
+	setup("")
+	defer Close()
+
+	// Store messages for different users
+	body1 := []byte("From: a@b.com\r\nTo: alice@test.com\r\nSubject: alice msg\r\n\r\nbody for alice")
+	if _, err := Store(&body1, nil, "", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	body2 := []byte("From: a@b.com\r\nTo: bob@test.com\r\nSubject: bob msg\r\n\r\nbody for bob")
+	if _, err := Store(&body2, nil, "", "bob"); err != nil {
+		t.Fatal(err)
+	}
+	body3 := []byte("From: a@b.com\r\nTo: c@d.com\r\nSubject: shared msg\r\n\r\nshared body")
+	if _, err := Store(&body3, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Alice should see only her own message (shared not visible to IMAP users)
+	total, unread, _, err := MailboxCounts("", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 {
+		t.Errorf("alice: expected total 1 (own only), got %d", total)
+	}
+	if unread != 1 {
+		t.Errorf("alice: expected unread 1, got %d", unread)
+	}
+
+	// Bob should see only his own message
+	total, unread, _, err = MailboxCounts("", "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 {
+		t.Errorf("bob: expected total 1 (own only), got %d", total)
+	}
+	if unread != 1 {
+		t.Errorf("bob: expected unread 1, got %d", unread)
+	}
+
+	// No user filter should see all 3
+	total, _, _, err = MailboxCounts("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 {
+		t.Errorf("no filter: expected total 3, got %d", total)
+	}
+
+	// Test with folder filter
+	body4 := []byte("From: a@b.com\r\nTo: alice@test.com\r\nSubject: alice sent\r\n\r\nsent body")
+	if _, err := Store(&body4, nil, "Sent", "alice"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Alice should see 1 in Sent
+	total, _, _, err = MailboxCounts("Sent", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 {
+		t.Errorf("alice Sent: expected total 1, got %d", total)
+	}
+
+	// Bob should see 0 in Sent
+	total, _, _, err = MailboxCounts("Sent", "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 0 {
+		t.Errorf("bob Sent: expected total 0, got %d", total)
+	}
+}
+
+func TestPerUserIsolation(t *testing.T) {
+	setup("")
+	defer Close()
+
+	// Store messages for alice
+	body1 := []byte("From: a@b.com\r\nTo: alice@test.com\r\nSubject: alice private\r\n\r\nalice body")
+	if _, err := Store(&body1, nil, "", "alice"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Store shared message
+	body2 := []byte("From: a@b.com\r\nTo: c@d.com\r\nSubject: shared\r\n\r\nshared body")
+	if _, err := Store(&body2, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Alice should see her message via List (shared not visible to IMAP users)
+	msgs, err := List(0, 0, 0, "", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 {
+		t.Errorf("alice List: expected 1 message (own only), got %d", len(msgs))
+	}
+
+	// Bob should see nothing (no messages tagged to bob, shared invisible)
+	msgs, err = List(0, 0, 0, "", "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 0 {
+		t.Errorf("bob List: expected 0 messages, got %d", len(msgs))
+	}
+
+	// No user filter sees all
+	msgs, err = List(0, 0, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 {
+		t.Errorf("no filter List: expected 2 messages, got %d", len(msgs))
+	}
+}
+
+func TestMoveMessage(t *testing.T) {
+	setup("")
+	defer Close()
+
+	body := []byte("From: a@b.com\r\nTo: c@d.com\r\nSubject: moveme\r\n\r\nmove body")
+	id, err := Store(&body, nil, "", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify it's in INBOX (folder="")
+	msgs, err := List(0, 0, 0, "", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message in INBOX, got %d", len(msgs))
+	}
+
+	// Move to Trash
+	if err := MoveMessage(id, "Trash"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should be gone from INBOX
+	msgs, err = List(0, 0, 0, "", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 0 {
+		t.Errorf("expected 0 messages in INBOX after move, got %d", len(msgs))
+	}
+
+	// Should be in Trash
+	msgs, err = List(0, 0, 0, "Trash", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 {
+		t.Errorf("expected 1 message in Trash after move, got %d", len(msgs))
+	}
+
+	// Move back to INBOX
+	if err := MoveMessage(id, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err = List(0, 0, 0, "", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 {
+		t.Errorf("expected 1 message back in INBOX, got %d", len(msgs))
+	}
+}
+
+func TestDeleteMessages(t *testing.T) {
+	setup("")
+	defer Close()
+
+	body1 := []byte("From: a@b.com\r\nTo: c@d.com\r\nSubject: delete me\r\n\r\nbody1")
+	id1, err := Store(&body1, nil, "", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body2 := []byte("From: a@b.com\r\nTo: c@d.com\r\nSubject: keep me\r\n\r\nbody2")
+	id2, err := Store(&body2, nil, "", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body3 := []byte("From: a@b.com\r\nTo: c@d.com\r\nSubject: shared\r\n\r\nbody3")
+	_, err = Store(&body3, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify 3 total (no user filter sees all)
+	total, _, _, err := MailboxCounts("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 {
+		t.Fatalf("expected 3 total, got %d", total)
+	}
+
+	// Delete alice's first message
+	if err := DeleteMessages([]string{id1}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify alice has 1, shared still 1, total 2
+	total, _, _, err = MailboxCounts("", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 {
+		t.Errorf("alice: expected 1 after delete, got %d", total)
+	}
+
+	// Delete bob's message
+	if err := DeleteMessages([]string{id2}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Only shared left
+	total, _, _, err = MailboxCounts("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 {
+		t.Errorf("expected 1 shared message remaining, got %d", total)
+	}
+}
+
+func TestDeleteAllMessages(t *testing.T) {
+	setup("")
+	defer Close()
+
+	body1 := []byte("From: a@b.com\r\nTo: c@d.com\r\nSubject: one\r\n\r\nbody1")
+	if _, err := Store(&body1, nil, "", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	body2 := []byte("From: a@b.com\r\nTo: c@d.com\r\nSubject: two\r\n\r\nbody2")
+	if _, err := Store(&body2, nil, "", "bob"); err != nil {
+		t.Fatal(err)
+	}
+	body3 := []byte("From: a@b.com\r\nTo: c@d.com\r\nSubject: three\r\n\r\nbody3")
+	if _, err := Store(&body3, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := DeleteAllMessages(); err != nil {
+		t.Fatal(err)
+	}
+
+	total, _, _, err := MailboxCounts("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 0 {
+		t.Errorf("expected 0 after delete all, got %d", total)
+	}
+
+	// Verify per-user counts are also 0
+	total, _, _, err = MailboxCounts("", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 0 {
+		t.Errorf("alice: expected 0 after delete all, got %d", total)
+	}
+}
+
 func TestStoreUnparsableMessage(t *testing.T) {
 	setup("")
 	defer Close()
 
-	t.Log("Testing a message the MIME parser cannot read")
-
-	messages := map[string]string{
+	for name, message := range map[string]string{
 		"invalid Content-Type": "From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Invalid content type\r\n" +
 			"Content-Type: text/plain>\r\n\r\nBody\r\n",
 		"multipart without boundary": "From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: No boundary\r\n" +
 			"Content-Type: multipart/report;\r\n\r\nBody\r\n",
-	}
-
-	for name, msg := range messages {
-		b := []byte(msg)
-		id, err := Store(&b, nil)
-
-		// the message can never be stored, so it must be rejected with a permanent SMTP error
+	} {
+		body := []byte(message)
+		id, err := Store(&body, nil, "")
 		if err == nil || !strings.HasPrefix(err.Error(), "554 ") {
 			t.Errorf("%s: expected a 554 error, got %v (id %q)", name, err, id)
 		}
 	}
-
 	assertEqual(t, CountTotal(), uint64(0), "no message should be stored")
 }

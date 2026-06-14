@@ -146,7 +146,10 @@ func sendCustomFetch(conn net.Conn, seq int, msg imapMessage, attrs string) {
 		if p.data == nil {
 			fmt.Fprintf(conn, "%s", p.tag)
 		} else {
-			fmt.Fprintf(conn, "%s {%d}\r\n", p.tag, len(p.data))
+			// LITERAL+ (RFC 7888): the "+" suffix tells the client not to
+			// send a continuation response, allowing the server to continue
+			// writing the FETCH response immediately after the literal data.
+			fmt.Fprintf(conn, "%s {%d+}\r\n", p.tag, len(p.data))
 			if len(p.data) > 0 {
 				if _, err := conn.Write(p.data); err != nil {
 					return
@@ -172,7 +175,7 @@ func formatInternalDate(t time.Time) string {
 func getEnvelope(id string) string {
 	raw, err := storage.GetMessageRaw(id)
 	if err != nil {
-		return "NIL"
+		return "(NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL)"
 	}
 
 	return buildEnvelopeFromRaw(raw)
@@ -268,7 +271,8 @@ func extractAddresses(text, header string) string {
 func parseIMAPAddresses(addrStr string) []string {
 	var result []string
 
-	parts := strings.Split(addrStr, ",")
+	// Split on commas while respecting quoted strings
+	parts := splitRespectingQuotes(addrStr, ',')
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "" {
@@ -299,6 +303,50 @@ func parseIMAPAddresses(addrStr string) []string {
 		)
 
 		result = append(result, addr)
+	}
+
+	return result
+}
+
+// splitRespectingQuotes splits a string by a delimiter, respecting quoted substrings.
+func splitRespectingQuotes(s string, delim byte) []string {
+	var result []string
+	var current strings.Builder
+	inQuote := false
+	escape := false
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+
+		if escape {
+			current.WriteByte(c)
+			escape = false
+			continue
+		}
+
+		if c == '\\' && inQuote {
+			current.WriteByte(c)
+			escape = true
+			continue
+		}
+
+		if c == '"' {
+			inQuote = !inQuote
+			current.WriteByte(c)
+			continue
+		}
+
+		if c == delim && !inQuote {
+			result = append(result, current.String())
+			current.Reset()
+			continue
+		}
+
+		current.WriteByte(c)
+	}
+
+	if current.Len() > 0 {
+		result = append(result, current.String())
 	}
 
 	return result
@@ -577,7 +625,7 @@ func parsePartialRange(attr string) (baseAttr string, offset, size int, hasParti
 func getBodyPart(id, attr string) fetchLiteral {
 	raw, err := storage.GetMessageRaw(id)
 	if err != nil {
-		return fetchLiteral{tag: "NIL"}
+		return fetchLiteral{tag: fmt.Sprintf("%s NIL", attr)}
 	}
 
 	text := string(raw)

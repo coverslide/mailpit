@@ -14,6 +14,8 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/axllent/mailpit/config"
@@ -21,9 +23,31 @@ import (
 	"github.com/axllent/mailpit/internal/storage"
 )
 
+// idleConns tracks connections currently in the IDLE state for diagnostics.
+var idleConns sync.Map
+
+// Diagnostic counters for debugging stalls.
+var (
+	inFlight   atomic.Int32
+	noopCount  atomic.Int64
+	cmdCount   atomic.Int64
+	connCount  atomic.Int32
+)
+
+func init() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			logger.Log().Debugf("[imap] DIAGNOSTIC: in-flight=%d conn=%d cmds=%d noops=%d",
+				inFlight.Load(), connCount.Load(), cmdCount.Load(), noopCount.Load())
+		}
+	}()
+}
+
 const (
 	// IMAP capability string
-	imapCapabilities = "IMAP4rev1 LOGIN-REFERRALS AUTH=PLAIN UIDPLUS LITERAL+ NAMESPACE IDLE MOVE CHILDREN"
+	imapCapabilities = "IMAP4rev1 AUTH=PLAIN LITERAL+ NAMESPACE IDLE CHILDREN"
 )
 
 // Run will start the IMAP server if configured
@@ -86,6 +110,33 @@ const (
 	stateSelected
 )
 
+// standardMailbox defines a virtual IMAP folder with its special-use attribute.
+type standardMailbox struct {
+	Name        string
+	SpecialUse string // RFC 6154 attribute, e.g. \Sent
+}
+
+// standardMailboxes lists the folders advertised by Mailpit for client compatibility.
+// INBOX is always real; the rest are empty stubs so that IMAP clients can discover
+// and auto-assign their roles (Sent, Trash, Drafts).
+var standardMailboxes = []standardMailbox{
+	{Name: "INBOX"},
+	{Name: "Sent", SpecialUse: "\\Sent"},
+	{Name: "Trash", SpecialUse: "\\Trash"},
+	{Name: "Drafts", SpecialUse: "\\Drafts"},
+}
+
+// isStandardMailbox returns true if name matches a known standard folder (case-insensitive).
+func isStandardMailbox(name string) bool {
+	upper := strings.ToUpper(name)
+	for _, m := range standardMailboxes {
+		if strings.ToUpper(m.Name) == upper {
+			return true
+		}
+	}
+	return false
+}
+
 type mailbox struct {
 	Name       string
 	Messages   []imapMessage
@@ -113,6 +164,8 @@ func handleClient(conn net.Conn) {
 	timeoutDuration := 600 * time.Second
 
 	logger.Log().Debugf("[imap] connection opened by %s", conn.RemoteAddr().String())
+	connCount.Add(1)
+	defer connCount.Add(-1)
 
 	sendResponse(conn, "* OK [CAPABILITY "+imapCapabilities+"] Mailpit IMAP server")
 
@@ -136,8 +189,19 @@ func handleClient(conn net.Conn) {
 
 		logger.Log().Debugf("[imap] received: %s (%s)", rawLine, conn.RemoteAddr().String())
 
+		inFlight.Add(1)
+		start := time.Now()
 		if !handleCommand(conn, reader, rawLine, &state, &user, &mbox) {
+			inFlight.Add(-1)
 			return
+		}
+		elapsed := time.Since(start)
+		inFlight.Add(-1)
+		cmdCount.Add(1)
+
+		if elapsed > 5*time.Millisecond {
+			logger.Log().Debugf("[imap] SLOW COMMAND: %q from %s took %v (in-flight=%d)",
+				rawLine, conn.RemoteAddr().String(), elapsed, inFlight.Load())
 		}
 	}
 }
@@ -164,6 +228,7 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 		sendResponse(conn, "* CAPABILITY "+imapCapabilities)
 		sendResponse(conn, tag+" OK CAPABILITY completed")
 	case "NOOP":
+		noopCount.Add(1)
 		sendResponse(conn, tag+" OK NOOP completed")
 	case "LOGOUT":
 		sendResponse(conn, "* BYE Mailpit IMAP server logging out")
@@ -251,9 +316,10 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 		sendResponse(conn, fmt.Sprintf("* %d EXISTS", mb.Exists))
 		sendResponse(conn, fmt.Sprintf("* %d RECENT", mb.Recent))
 		sendResponse(conn, fmt.Sprintf("* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)"))
-		sendResponse(conn, fmt.Sprintf("* OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)]"))
-		sendResponse(conn, fmt.Sprintf("* OK [UIDNEXT %d]", mb.NextUID))
-		sendResponse(conn, fmt.Sprintf("* OK [UIDVALIDITY 1]"))
+		sendResponse(conn, "* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)")
+		sendResponse(conn, "* OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)] flags defined")
+		sendResponse(conn, fmt.Sprintf("* OK [UIDNEXT %d] predicted next UID", mb.NextUID))
+		sendResponse(conn, "* OK [UIDVALIDITY 1] UIDs valid")
 		sendResponse(conn, tag+" OK [READ-WRITE] SELECT completed")
 	case "EXAMINE":
 		if *state == stateNotAuthenticated {
@@ -272,9 +338,9 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 		sendResponse(conn, fmt.Sprintf("* %d EXISTS", mb.Exists))
 		sendResponse(conn, fmt.Sprintf("* %d RECENT", mb.Recent))
 		sendResponse(conn, "* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)")
-		sendResponse(conn, "* OK [PERMANENTFLAGS ()]")
-		sendResponse(conn, fmt.Sprintf("* OK [UIDNEXT %d]", mb.NextUID))
-		sendResponse(conn, "* OK [UIDVALIDITY 1]")
+		sendResponse(conn, "* OK [PERMANENTFLAGS ()] no permanent flags")
+		sendResponse(conn, fmt.Sprintf("* OK [UIDNEXT %d] predicted next UID", mb.NextUID))
+		sendResponse(conn, "* OK [UIDVALIDITY 1] UIDs valid")
 		sendResponse(conn, tag+" OK [READ-ONLY] EXAMINE completed")
 	case "CLOSE":
 		if *state != stateSelected {
@@ -296,9 +362,24 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 			sendResponse(conn, tag+" BAD invalid arguments")
 			return true
 		}
-		mailboxName := args[0]
-		mb := openMailbox(mailboxName, *user, true)
-		sendResponse(conn, fmt.Sprintf("* STATUS %s (MESSAGES %d UNSEEN %d UIDNEXT %d UIDVALIDITY 1)", mailboxName, mb.Exists, mb.Exists-mb.Seen, mb.NextUID))
+		mailboxName := strings.Trim(args[0], "\"")
+		folder := ""
+		upper := strings.ToUpper(mailboxName)
+		if upper != "INBOX" && isStandardMailbox(mailboxName) {
+			folder = mailboxName
+		} else if upper != "INBOX" && !isStandardMailbox(mailboxName) {
+			sendResponse(conn, tag+" NO mailbox not found")
+			return true
+		}
+
+		total, unread, nextUID, err := storage.MailboxCounts(folder)
+		if err != nil {
+			logger.Log().Errorf("[imap] status count error: %s", err.Error())
+			sendResponse(conn, tag+" NO status failed")
+			return true
+		}
+
+		sendResponse(conn, fmt.Sprintf("* STATUS %s (MESSAGES %d UNSEEN %d UIDNEXT %d UIDVALIDITY 1)", mailboxName, total, unread, nextUID))
 		sendResponse(conn, tag+" OK STATUS completed")
 	case "LIST":
 		if *state == stateNotAuthenticated {
@@ -313,19 +394,35 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 			wildcard = args[1]
 		}
 		wildcard = strings.Trim(wildcard, "\"")
-		if wildcard == "*" || wildcard == "%" || wildcard == "INBOX" || wildcard == "INBOX*" || wildcard == "INBOX%" {
-			sendResponse(conn, `* LIST (\HasNoChildren) "/" INBOX`)
+		for _, mb := range standardMailboxes {
+			if matchMailboxWildcard(wildcard, mb.Name) {
+				if mb.SpecialUse != "" {
+					sendResponse(conn, fmt.Sprintf(`* LIST (\HasNoChildren %s) "/" %s`, mb.SpecialUse, mb.Name))
+				} else {
+					sendResponse(conn, fmt.Sprintf(`* LIST (\HasNoChildren) "/" %s`, mb.Name))
+				}
+			}
 		}
 		sendResponse(conn, tag+" OK LIST completed")
 	case "LSUB":
-		sendResponse(conn, `* LSUB (\HasNoChildren) "/" INBOX`)
+		if *state == stateNotAuthenticated {
+			sendResponse(conn, tag+" BAD not authenticated")
+			return true
+		}
+		for _, mb := range standardMailboxes {
+			if mb.SpecialUse != "" {
+				sendResponse(conn, fmt.Sprintf(`* LSUB (\HasNoChildren %s) "/" %s`, mb.SpecialUse, mb.Name))
+			} else {
+				sendResponse(conn, fmt.Sprintf(`* LSUB (\HasNoChildren) "/" %s`, mb.Name))
+			}
+		}
 		sendResponse(conn, tag+" OK LSUB completed")
 	case "FETCH":
 		if *state != stateSelected {
 			sendResponse(conn, tag+" BAD no mailbox selected")
 			return true
 		}
-		handleFetch(conn, tag, args, **mbox, false)
+		handleFetch(conn, tag, args, mbox, false)
 	case "STORE":
 		if *state != stateSelected {
 			sendResponse(conn, tag+" BAD no mailbox selected")
@@ -344,26 +441,71 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 			return true
 		}
 		handleUID(conn, tag, args, mbox)
+	case "COPY":
+		if *state != stateSelected {
+			sendResponse(conn, tag+" BAD no mailbox selected")
+			return true
+		}
+		handleCopy(conn, tag, args, **mbox)
 	case "NAMESPACE":
 		sendResponse(conn, `* NAMESPACE (("" "/")) NIL NIL`)
 		sendResponse(conn, tag+" OK NAMESPACE completed")
 	case "IDLE":
+		if *state != stateSelected {
+			sendResponse(conn, tag+" BAD no mailbox selected")
+			return true
+		}
 		sendResponse(conn, "+ idling")
-	doneLoop:
+
+		addr := conn.RemoteAddr().String()
+		idleConns.Store(addr, time.Now())
+		logger.Log().Debugf("[imap] idle start: %s", addr)
+
+		sawDone := false
+		lastHeartbeat := time.Now()
 		for {
+			if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				logger.Log().Errorf("[imap] %s", err.Error())
+				break
+			}
 			line, err := reader.ReadString('\n')
 			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					if time.Since(lastHeartbeat) >= 30*time.Second {
+						logger.Log().Debugf("[imap] idle heartbeat: %s", addr)
+						lastHeartbeat = time.Now()
+					}
+					continue
+				}
+				logger.Log().Debugf("[imap] idle read error for %s: %s", addr, err)
 				break
 			}
 			line = strings.TrimRight(line, "\r\n")
-			switch strings.ToUpper(line) {
-			case "DONE":
-				break doneLoop
+			if strings.ToUpper(line) == "DONE" {
+				sawDone = true
+				break
 			}
 		}
+
+		idleConns.Delete(addr)
+		logger.Log().Debugf("[imap] idle end: %s (done=%v)", addr, sawDone)
 		sendResponse(conn, tag+" OK IDLE completed")
 	case "CHECK":
+		if *state != stateSelected {
+			sendResponse(conn, tag+" BAD no mailbox selected")
+			return true
+		}
 		sendResponse(conn, tag+" OK CHECK completed")
+	case "SUBSCRIBE":
+		sendResponse(conn, tag+" OK SUBSCRIBE completed")
+	case "UNSUBSCRIBE":
+		sendResponse(conn, tag+" OK UNSUBSCRIBE completed")
+	case "APPEND":
+		if *state == stateNotAuthenticated {
+			sendResponse(conn, tag+" BAD not authenticated")
+			return true
+		}
+		handleAppend(conn, tag, args)
 	case "EXPUNGE":
 		if *state != stateSelected {
 			sendResponse(conn, tag+" BAD no mailbox selected")
@@ -440,6 +582,13 @@ func splitImapLine(line string) []string {
 
 	if current.Len() > 0 {
 		result = append(result, current.String())
+	}
+
+	// Strip surrounding quotes from tokens
+	for i, token := range result {
+		if len(token) >= 2 && token[0] == '"' && token[len(token)-1] == '"' {
+			result[i] = token[1 : len(token)-1]
+		}
 	}
 
 	return result
@@ -547,11 +696,19 @@ func authenticateIMAP(username, password string) bool {
 
 func openMailbox(name string, user string, readOnly bool) mailbox {
 	name = strings.Trim(name, "\"")
-	if strings.ToUpper(name) != "INBOX" {
-		return mailbox{}
+
+	// Determine the folder filter for the List() query.
+	// INBOX maps to Folder="" (the default), standard virtual folders map to their name.
+	folder := ""
+	upper := strings.ToUpper(name)
+	if upper != "INBOX" {
+		if !isStandardMailbox(name) {
+			return mailbox{Name: name, ReadOnly: readOnly}
+		}
+		folder = name
 	}
 
-	messages, err := storage.List(0, 0, 0)
+	messages, err := storage.List(0, 0, 0, folder)
 	if err != nil {
 		logger.Log().Errorf("[imap] %s", err.Error())
 		return mailbox{}
@@ -568,7 +725,9 @@ func openMailbox(name string, user string, readOnly bool) mailbox {
 		if m.Read {
 			flags = append(flags, "\\Seen")
 		}
-		flags = append(flags, m.Tags...)
+		for _, tag := range m.Tags {
+			flags = append(flags, tagToIMAPFlag(tag))
+		}
 		seq := len(messages) - i
 		mb.Messages = append(mb.Messages, imapMessage{
 			ID:    m.ID,
@@ -668,7 +827,7 @@ func handleUID(conn net.Conn, tag string, args []string, mbox **mailbox) {
 
 	switch subCmd {
 	case "FETCH":
-		handleFetch(conn, tag, subArgs, **mbox, true)
+		handleFetch(conn, tag, subArgs, mbox, true)
 	case "STORE":
 		handleStore(conn, tag, subArgs, mbox)
 	case "SEARCH":
@@ -678,7 +837,7 @@ func handleUID(conn net.Conn, tag string, args []string, mbox **mailbox) {
 	}
 }
 
-func handleFetch(conn net.Conn, tag string, args []string, mbox mailbox, uidMode bool) {
+func handleFetch(conn net.Conn, tag string, args []string, mbox **mailbox, uidMode bool) {
 	if len(args) < 2 {
 		sendResponse(conn, tag+" BAD invalid arguments")
 		return
@@ -687,11 +846,23 @@ func handleFetch(conn net.Conn, tag string, args []string, mbox mailbox, uidMode
 	msgSet := args[0]
 	attr := args[1]
 
-	indices := parseMessageSet(msgSet, mbox.Exists, uidMode, mbox.Messages)
+	indices := parseMessageSet(msgSet, (*mbox).Exists, uidMode, (*mbox).Messages)
 
 	for _, idx := range indices {
-		msg := mbox.Messages[idx-1]
-		sendFetchResponse(conn, idx, msg, attr)
+		if idx < 1 || idx > len((*mbox).Messages) {
+			continue
+		}
+		msg := &(*mbox).Messages[idx-1]
+		sendFetchResponse(conn, idx, *msg, attr)
+
+		// RFC 3501: non-PEEK body access sets \Seen
+		normAttr := strings.Trim(strings.ToUpper(attr), "()")
+		if !isPeekAttr(normAttr) && isBodyAccess(normAttr) {
+			if !hasFlag(msg.Flags, "\\Seen") {
+				msg.Flags = addFlags(msg.Flags, []string{"\\Seen"})
+				syncReadStatus(msg)
+			}
+		}
 	}
 
 	sendResponse(conn, tag+" OK FETCH completed")
@@ -710,6 +881,7 @@ func handleStore(conn net.Conn, tag string, args []string, mbox **mailbox) {
 
 	msgSet := args[0]
 	action := strings.ToUpper(args[1])
+	actionBase := strings.TrimSuffix(action, ".SILENT")
 	flagsRaw := args[2]
 
 	flagsRaw = strings.Trim(flagsRaw, "()")
@@ -731,7 +903,7 @@ func handleStore(conn net.Conn, tag string, args []string, mbox **mailbox) {
 		}
 		msg := &(*mbox).Messages[idx-1]
 
-		switch action {
+		switch actionBase {
 		case "FLAGS":
 			msg.Flags = cleanFlags
 		case "+FLAGS":
@@ -740,10 +912,12 @@ func handleStore(conn net.Conn, tag string, args []string, mbox **mailbox) {
 			msg.Flags = removeFlags(msg.Flags, cleanFlags)
 		}
 
-		// Sync read status to database
-		syncReadStatus(msg)
+		// Sync flags to database
+		syncFlagsToStorage(msg)
 
-		sendResponse(conn, fmt.Sprintf("* %d FETCH (FLAGS (%s))", idx, strings.Join(msg.Flags, " ")))
+		if action == actionBase {
+			sendResponse(conn, fmt.Sprintf("* %d FETCH (FLAGS (%s))", idx, strings.Join(msg.Flags, " ")))
+		}
 	}
 
 	sendResponse(conn, tag+" OK STORE completed")
@@ -766,6 +940,59 @@ func syncReadStatus(msg *imapMessage) {
 		if err := storage.MarkUnread([]string{msg.ID}); err != nil {
 			logger.Log().Errorf("[imap] error marking unread: %s", err.Error())
 		}
+	}
+}
+
+// syncFlagsToStorage persists the in-memory IMAP flags for a message to the
+// database: \Seen maps to the Read column, all other flags map to tags.
+func syncFlagsToStorage(msg *imapMessage) {
+	syncReadStatus(msg)
+
+	var tags []string
+	for _, f := range msg.Flags {
+		if f == "\\Seen" {
+			continue
+		}
+		// Store IMAP system flags (e.g. \Draft) as lowercase tag names.
+		tag := strings.TrimPrefix(f, "\\")
+		tag = strings.ToLower(tag)
+		if tag != "" {
+			tags = append(tags, tag)
+		}
+	}
+
+	if len(tags) > 0 || msg.hasNonSeenFlag() {
+		if _, err := storage.SetMessageTags(msg.ID, tags); err != nil {
+			logger.Log().Errorf("[imap] error setting tags: %s", err.Error())
+		}
+	}
+}
+
+func (msg *imapMessage) hasNonSeenFlag() bool {
+	for _, f := range msg.Flags {
+		if f != "\\Seen" {
+			return true
+		}
+	}
+	return false
+}
+
+// tagToIMAPFlag converts a stored tag name back to an IMAP flag.
+// Known system flag tags are returned with the leading backslash.
+func tagToIMAPFlag(tag string) string {
+	switch strings.ToLower(tag) {
+	case "seen":
+		return "\\Seen"
+	case "answered":
+		return "\\Answered"
+	case "flagged":
+		return "\\Flagged"
+	case "deleted":
+		return "\\Deleted"
+	case "draft":
+		return "\\Draft"
+	default:
+		return tag
 	}
 }
 
@@ -797,6 +1024,16 @@ func removeFlags(existing, remove []string) []string {
 		result = append(result, f)
 	}
 	return result
+}
+
+func isPeekAttr(attr string) bool {
+	return strings.Contains(strings.ToUpper(attr), "BODY.PEEK")
+}
+
+func isBodyAccess(attr string) bool {
+	upper := strings.ToUpper(attr)
+	return strings.HasPrefix(upper, "BODY[") || upper == "BODY" ||
+		strings.HasPrefix(upper, "RFC822")
 }
 
 func handleSearch(conn net.Conn, tag string, args []string, mbox mailbox) {
@@ -1363,4 +1600,134 @@ func hasFlag(flags []string, flag string) bool {
 		}
 	}
 	return false
+}
+
+// matchMailboxWildcard matches a LIST reference name against a mailbox name.
+// "*" matches everything, "%" matches within a hierarchy level.
+func matchMailboxWildcard(wildcard, name string) bool {
+	if wildcard == "*" || wildcard == "%" {
+		return true
+	}
+	upper := strings.ToUpper(wildcard)
+	nameUpper := strings.ToUpper(name)
+	if strings.HasPrefix(upper, strings.ToUpper(name)) {
+		return true
+	}
+	if strings.Contains(upper, "*") || strings.Contains(upper, "%") {
+		// Simple glob: * matches any suffix, % matches within level
+		base := strings.TrimRight(upper, "*%")
+		return strings.HasPrefix(nameUpper, base)
+	}
+	return upper == nameUpper
+}
+
+// handleAppend processes the APPEND command: APPEND mailbox [flags] [date-time] literal
+func handleAppend(conn net.Conn, tag string, args []string) {
+	if len(args) < 2 {
+		sendResponse(conn, tag+" BAD invalid arguments")
+		return
+	}
+
+	mailboxName := strings.Trim(args[0], "\"")
+
+	// Determine the folder from the mailbox name
+	folder := ""
+	upper := strings.ToUpper(mailboxName)
+	if upper != "INBOX" && isStandardMailbox(mailboxName) {
+		folder = mailboxName
+	} else if upper != "INBOX" && !isStandardMailbox(mailboxName) {
+		// Unknown mailbox — reject for now
+		sendResponse(conn, tag+" NO mailbox not found")
+		return
+	}
+
+	// Parse optional flags and date-time from middle args
+	// Last arg is always the literal data (message body)
+	var flags []string
+	var messageData string
+	var appendDate *time.Time
+
+	// The literal data is always the last arg (already read by handleCommand)
+	messageData = args[len(args)-1]
+
+	// Middle args may contain flags (parenthesized) and/or date-time (quoted)
+	for _, arg := range args[1 : len(args)-1] {
+		if strings.HasPrefix(arg, "(") {
+			// Flags: (\Seen \Draft) — strip parens and split
+			flagsRaw := strings.Trim(arg, "()")
+			for _, f := range strings.Fields(flagsRaw) {
+				flags = append(flags, f)
+			}
+		} else if t, err := time.Parse("02-Jan-2006 15:04:05 -0700", arg); err == nil {
+			// Date-time: dd-Mon-yyyy hh:mm:ss +hhmm
+			appendDate = &t
+		}
+	}
+
+	body := []byte(messageData)
+	id, err := storage.Store(&body, nil, folder)
+	if err != nil {
+		sendResponse(conn, tag+" NO store failed: "+err.Error())
+		return
+	}
+	if id == "" {
+		sendResponse(conn, tag+" NO APPEND failed: invalid message data")
+		return
+	}
+
+	// Override Created timestamp with the client-provided date-time.
+	if appendDate != nil {
+		if err := storage.UpdateCreated(id, *appendDate); err != nil {
+			logger.Log().Errorf("[imap] failed to update created date: %s", err.Error())
+		}
+	}
+
+	// Apply flags by creating a temporary imapMessage and syncing to storage.
+	appendedMsg := imapMessage{ID: id, Flags: flags}
+	syncFlagsToStorage(&appendedMsg)
+
+	sendResponse(conn, tag+" OK APPEND completed")
+}
+
+// handleCopy processes the COPY command: COPY sequence-set mailbox
+func handleCopy(conn net.Conn, tag string, args []string, mbox mailbox) {
+	if len(args) < 2 {
+		sendResponse(conn, tag+" BAD invalid arguments")
+		return
+	}
+
+	msgSet := args[0]
+	destName := strings.Trim(args[1], "\"")
+
+	// Determine destination folder
+	destFolder := ""
+	upper := strings.ToUpper(destName)
+	if upper != "INBOX" && isStandardMailbox(destName) {
+		destFolder = destName
+	} else if upper != "INBOX" && !isStandardMailbox(destName) {
+		sendResponse(conn, tag+" NO destination mailbox not found")
+		return
+	}
+
+	indices := parseMessageSet(msgSet, mbox.Exists, false, mbox.Messages)
+
+	for _, idx := range indices {
+		if idx < 1 || idx > len(mbox.Messages) {
+			continue
+		}
+		msg := mbox.Messages[idx-1]
+		raw, err := storage.GetMessageRaw(msg.ID)
+		if err != nil {
+			continue
+		}
+		newID, err := storage.Store(&raw, nil, destFolder)
+		if err != nil || newID == "" {
+			continue
+		}
+		// Preserve source flags on the copied message.
+		copied := imapMessage{ID: newID, Flags: msg.Flags}
+		syncFlagsToStorage(&copied)
+	}
+
+	sendResponse(conn, tag+" OK COPY completed")
 }

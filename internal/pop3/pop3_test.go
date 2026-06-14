@@ -560,7 +560,7 @@ func insertEmailData(t *testing.T) {
 
 		bufBytes := buf.Bytes()
 
-		id, err := storage.Store(&bufBytes, nil)
+		id, err := storage.Store(&bufBytes, nil, "")
 		if err != nil {
 			t.Log("error ", err)
 			t.Fail()

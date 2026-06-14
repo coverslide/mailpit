@@ -754,7 +754,7 @@ func TestFullIMAPConversation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = storage.Store(&msgData, nil)
+	_, err = storage.Store(&msgData, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -839,7 +839,7 @@ func TestFullIMAPConversation(t *testing.T) {
 	}
 	fetchLine2 = strings.TrimSpace(fetchLine2)
 	if !strings.Contains(fetchLine2, "BODY[] {") {
-		t.Fatalf("expected BODY[] {N}, got %q", fetchLine2)
+		t.Fatalf("expected BODY[] {N+}, got %q", fetchLine2)
 	}
 
 	braceStart := strings.Index(fetchLine2, "{")
@@ -847,7 +847,10 @@ func TestFullIMAPConversation(t *testing.T) {
 	if braceStart < 0 || braceEnd <= braceStart {
 		t.Fatalf("cannot parse literal size from %q", fetchLine2)
 	}
-	literalSize, err := strconv.Atoi(fetchLine2[braceStart+1 : braceEnd])
+	// LITERAL+ syntax: {N+}
+	sizeStr := fetchLine2[braceStart+1 : braceEnd]
+	sizeStr = strings.TrimSuffix(sizeStr, "+")
+	literalSize, err := strconv.Atoi(sizeStr)
 	if err != nil {
 		t.Fatalf("invalid literal size: %v", err)
 	}

@@ -175,7 +175,9 @@ func (f *imapTest) readFetchResponse(tag string) (header string, literal []byte,
 	br := strings.Index(header, "{")
 	be := strings.Index(header, "}")
 	if br >= 0 && be > br {
-		n, err := strconv.Atoi(header[br+1 : be])
+		sizeStr := header[br+1 : be]
+		sizeStr = strings.TrimSuffix(sizeStr, "+")
+		n, err := strconv.Atoi(sizeStr)
 		if err != nil {
 			f.t.Fatalf("bad literal size in %q: %v", header, err)
 		}
@@ -191,7 +193,7 @@ func (f *imapTest) readFetchResponse(tag string) (header string, literal []byte,
 }
 
 func storeMsg(raw []byte) string {
-	id, err := storage.Store(&raw, nil)
+	id, err := storage.Store(&raw, nil, "")
 	if err != nil {
 		panic(fmt.Sprintf("Store: %v", err))
 	}
@@ -204,6 +206,92 @@ func msg(subj, body string) []byte {
 
 func msgMulti() []byte {
 	return []byte("From: s@t.com\r\nTo: r@t.com\r\nSubject: Multi\r\nDate: Thu, 02 Jan 2025 12:00:00 +0000\r\nMessage-ID: <m@t>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nPlain\r\n--b\r\nContent-Type: text/html\r\n\r\n<b>HTML</b>\r\n--b--\r\n")
+}
+
+func msgMixed() []byte {
+	attachment := base64.StdEncoding.EncodeToString([]byte("%PDF-1.4 fake pdf content"))
+	return []byte(fmt.Sprintf(
+		"From: Alice Smith <alice@example.com>\r\n"+
+			"To: Bob Ross <bob@example.com>\r\n"+
+			"Subject: Mixed Test\r\n"+
+			"Date: Fri, 03 Jan 2025 14:00:00 +0000\r\n"+
+			"Message-ID: <mixed@t>\r\n"+
+			"MIME-Version: 1.0\r\n"+
+			"Content-Type: multipart/mixed; boundary=\"mix\"\r\n"+
+			"\r\n"+
+			"--mix\r\n"+
+			"Content-Type: text/plain; charset=utf-8\r\n"+
+			"\r\n"+
+			"Here is the document.\r\n"+
+			"--mix\r\n"+
+			"Content-Type: application/pdf; name=\"doc.pdf\"\r\n"+
+			"Content-Disposition: attachment; filename=\"doc.pdf\"\r\n"+
+			"Content-Transfer-Encoding: base64\r\n"+
+			"\r\n"+
+			"%s\r\n"+
+			"--mix--\r\n", attachment))
+}
+
+func msgMixedAlt() []byte {
+	attachment := base64.StdEncoding.EncodeToString([]byte("%PDF-1.4 real pdf"))
+	return []byte(fmt.Sprintf(
+		"From: Carol Danvers <carol@example.com>\r\n"+
+			"To: Tony Stark <tony@example.com>, Steve Rogers <steve@example.com>\r\n"+
+			"Cc: Bruce Banner <bruce@example.com>\r\n"+
+			"Subject: Report with Attachment\r\n"+
+			"Date: Sat, 04 Jan 2025 09:00:00 +0000\r\n"+
+			"Message-ID: <mixedalt@t>\r\n"+
+			"Reply-To: Carol D <reply@example.com>\r\n"+
+			"References: <thread1@old> <thread2@older>\r\n"+
+			"In-Reply-To: <thread2@older>\r\n"+
+			"MIME-Version: 1.0\r\n"+
+			"Content-Type: multipart/mixed; boundary=\"mab\"\r\n"+
+			"\r\n"+
+			"--mab\r\n"+
+			"Content-Type: multipart/alternative; boundary=\"alt\"\r\n"+
+			"\r\n"+
+			"--alt\r\n"+
+			"Content-Type: text/plain; charset=utf-8\r\n"+
+			"\r\n"+
+			"Please see the attached report.\r\n"+
+			"--alt\r\n"+
+			"Content-Type: text/html; charset=utf-8\r\n"+
+			"\r\n"+
+			"<p>Please see the attached <b>report</b>.</p>\r\n"+
+			"--alt--\r\n"+
+			"\r\n"+
+			"--mab\r\n"+
+			"Content-Type: application/pdf; name=\"report.pdf\"\r\n"+
+			"Content-Disposition: attachment; filename=\"report.pdf\"\r\n"+
+			"Content-Transfer-Encoding: base64\r\n"+
+			"\r\n"+
+			"%s\r\n"+
+			"--mab--\r\n", attachment))
+}
+
+func msgRelated() []byte {
+	img := base64.StdEncoding.EncodeToString([]byte("\x89PNG fake image data"))
+	return []byte(fmt.Sprintf(
+		"From: Dave Lee <dave@example.com>\r\n"+
+			"To: Eve Park <eve@example.com>\r\n"+
+			"Subject: Inline Image\r\n"+
+			"Date: Sun, 05 Jan 2025 11:00:00 +0000\r\n"+
+			"Message-ID: <related@t>\r\n"+
+			"MIME-Version: 1.0\r\n"+
+			"Content-Type: multipart/related; boundary=\"rel\"\r\n"+
+			"\r\n"+
+			"--rel\r\n"+
+			"Content-Type: text/html; charset=utf-8\r\n"+
+			"\r\n"+
+			"<p>Hello <img src=\"cid:photo.png\"></p>\r\n"+
+			"--rel\r\n"+
+			"Content-Type: image/png; name=\"photo.png\"\r\n"+
+			"Content-ID: <photo.png@cid>\r\n"+
+			"Content-Disposition: inline; filename=\"photo.png\"\r\n"+
+			"Content-Transfer-Encoding: base64\r\n"+
+			"\r\n"+
+			"%s\r\n"+
+			"--rel--\r\n", img))
 }
 
 // ---------------------------------------------------------------------------
@@ -818,5 +906,521 @@ func TestE2ETags(t *testing.T) {
 	lines2 := f.cmd("FETCH 1 (FLAGS)")
 	if strings.Contains(lines2[0], "urgent") {
 		t.Errorf("tag should be removed, got %q", lines2[0])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// multipart + attachment tests
+// ---------------------------------------------------------------------------
+
+func TestE2EMixedBodyStructure(t *testing.T) {
+	f := newIMAPTest(t)
+	defer f.close()
+	f.login("u", "pass")
+	storeMsg(msgMixed())
+	f.selectInbox()
+
+	hdr, _, _, _ := f.fetchCmd(1, "BODYSTRUCTURE")
+	structure := hdr
+	t.Logf("BODYSTRUCTURE: %s", structure)
+
+	if !strings.Contains(structure, `"mixed"`) {
+		t.Errorf("expected multipart/mixed, got %q", structure)
+	}
+	if !strings.Contains(structure, `"plain"`) {
+		t.Errorf("expected text/plain child, got %q", structure)
+	}
+	if !strings.Contains(structure, `"pdf"`) {
+		t.Errorf("expected application/pdf child, got %q", structure)
+	}
+}
+
+func TestE2EMixedFetchParts(t *testing.T) {
+	f := newIMAPTest(t)
+	defer f.close()
+	f.login("u", "pass")
+	storeMsg(msgMixed())
+	f.selectInbox()
+
+	// Part 1: text/plain body
+	_, lit1, _, _ := f.fetchCmd(1, "BODY[1]")
+	part1 := string(lit1)
+	if !strings.Contains(part1, "text/plain") {
+		t.Errorf("part 1 should contain text/plain header, got %q", part1)
+	}
+	if !strings.Contains(part1, "Here is the document") {
+		t.Errorf("part 1 should contain body text, got %q", part1)
+	}
+
+	// Part 2: application/pdf attachment
+	_, lit2, _, _ := f.fetchCmd(1, "BODY[2]")
+	part2 := string(lit2)
+	if !strings.Contains(part2, "application/pdf") {
+		t.Errorf("part 2 should contain application/pdf header, got %q", part2)
+	}
+	if !strings.Contains(part2, "Content-Transfer-Encoding: base64") {
+		t.Errorf("part 2 should have base64 encoding header, got %q", part2)
+	}
+	if !strings.Contains(part2, "doc.pdf") {
+		t.Errorf("part 2 should reference doc.pdf filename, got %q", part2)
+	}
+
+	// Part 1.HEADER: just MIME headers of part 1
+	_, lit1h, _, _ := f.fetchCmd(1, "BODY[1.HEADER]")
+	hdr1 := string(lit1h)
+	if !strings.Contains(hdr1, "Content-Type") {
+		t.Errorf("1.HEADER should have Content-Type, got %q", hdr1)
+	}
+	if strings.Contains(hdr1, "document") {
+		t.Errorf("1.HEADER should not have body content, got %q", hdr1)
+	}
+
+	// Part 1.TEXT: just body of part 1
+	_, lit1t, _, _ := f.fetchCmd(1, "BODY[1.TEXT]")
+	text1 := string(lit1t)
+	if !strings.Contains(text1, "Here is the document") {
+		t.Errorf("1.TEXT should have body text, got %q", text1)
+	}
+	if strings.Contains(text1, "Content-Type") {
+		t.Errorf("1.TEXT should not have headers, got %q", text1)
+	}
+}
+
+func TestE2EMixedSearch(t *testing.T) {
+	f := newIMAPTest(t)
+	defer f.close()
+	f.login("u", "pass")
+	storeMsg(msgMixed())
+	f.selectInbox()
+
+	// SEARCH should find text in the body (plain text part)
+	lines := f.cmd(`SEARCH BODY "document"`)
+	if !strings.Contains(lines[0], "SEARCH 1") {
+		t.Errorf("SEARCH BODY should find message, got %q", lines[0])
+	}
+
+	// SEARCH on subject
+	lines3 := f.cmd(`SEARCH SUBJECT "Mixed Test"`)
+	if !strings.Contains(lines3[0], "SEARCH 1") {
+		t.Errorf("SEARCH SUBJECT should find message, got %q", lines3[0])
+	}
+}
+
+func TestE2EMixedAltBodyStructure(t *testing.T) {
+	f := newIMAPTest(t)
+	defer f.close()
+	f.login("u", "pass")
+	storeMsg(msgMixedAlt())
+	f.selectInbox()
+
+	hdr, _, _, _ := f.fetchCmd(1, "BODYSTRUCTURE")
+	structure := hdr
+	t.Logf("BODYSTRUCTURE: %s", structure)
+
+	if !strings.Contains(structure, `"mixed"`) {
+		t.Errorf("expected multipart/mixed, got %q", structure)
+	}
+	// Should have nested multipart/alternative
+	if !strings.Contains(structure, `"alternative"`) {
+		t.Errorf("expected nested multipart/alternative, got %q", structure)
+	}
+	// Should have pdf attachment
+	if !strings.Contains(structure, `"pdf"`) {
+		t.Errorf("expected application/pdf, got %q", structure)
+	}
+}
+
+func TestE2EMixedAltFetchParts(t *testing.T) {
+	f := newIMAPTest(t)
+	defer f.close()
+	f.login("u", "pass")
+	storeMsg(msgMixedAlt())
+	f.selectInbox()
+
+	// Part 1: the multipart/alternative part (contains text/plain and text/html)
+	_, lit1, _, _ := f.fetchCmd(1, "BODY[1]")
+	part1 := string(lit1)
+	t.Logf("Part 1: %q", part1)
+	if !strings.Contains(part1, "multipart/alternative") {
+		t.Errorf("part 1 should be multipart/alternative, got %q", part1)
+	}
+
+	// Part 1.1: text/plain within the alternative
+	_, lit11, _, _ := f.fetchCmd(1, "BODY[1.1]")
+	part11 := string(lit11)
+	if !strings.Contains(part11, "text/plain") {
+		t.Errorf("part 1.1 should be text/plain, got %q", part11)
+	}
+	if !strings.Contains(part11, "Please see the attached report") {
+		t.Errorf("part 1.1 should have plain text body, got %q", part11)
+	}
+
+	// Part 1.2: text/html within the alternative
+	_, lit12, _, _ := f.fetchCmd(1, "BODY[1.2]")
+	part12 := string(lit12)
+	if !strings.Contains(part12, "text/html") {
+		t.Errorf("part 1.2 should be text/html, got %q", part12)
+	}
+	if !strings.Contains(part12, "<b>report</b>") {
+		t.Errorf("part 1.2 should have HTML body, got %q", part12)
+	}
+
+	// Part 2: application/pdf attachment
+	_, lit2, _, _ := f.fetchCmd(1, "BODY[2]")
+	part2 := string(lit2)
+	if !strings.Contains(part2, "application/pdf") {
+		t.Errorf("part 2 should be application/pdf, got %q", part2)
+	}
+	if !strings.Contains(part2, "Content-Transfer-Encoding: base64") {
+		t.Errorf("part 2 should have base64 encoding, got %q", part2)
+	}
+}
+
+func TestE2EMixedAltEnvelope(t *testing.T) {
+	f := newIMAPTest(t)
+	defer f.close()
+	f.login("u", "pass")
+	storeMsg(msgMixedAlt())
+	f.selectInbox()
+
+	hdr, _, _, _ := f.fetchCmd(1, "ENVELOPE")
+	envelope := hdr
+	t.Logf("ENVELOPE: %s", envelope)
+
+	// Subject should be present
+	if !strings.Contains(envelope, `"Report with Attachment"`) {
+		t.Errorf("envelope subject should contain Report with Attachment, got %q", envelope)
+	}
+	// From address
+	if !strings.Contains(envelope, `"carol" "example.com"`) {
+		t.Errorf("envelope from should contain carol@example.com, got %q", envelope)
+	}
+	// To addresses (2 recipients)
+	if !strings.Contains(envelope, `"tony" "example.com"`) {
+		t.Errorf("envelope to should contain tony@example.com, got %q", envelope)
+	}
+	if !strings.Contains(envelope, `"steve" "example.com"`) {
+		t.Errorf("envelope to should contain steve@example.com, got %q", envelope)
+	}
+	// CC
+	if !strings.Contains(envelope, `"bruce" "example.com"`) {
+		t.Errorf("envelope cc should contain bruce@example.com, got %q", envelope)
+	}
+}
+
+func TestE2EMixedAltSearch(t *testing.T) {
+	f := newIMAPTest(t)
+	defer f.close()
+	f.login("u", "pass")
+	storeMsg(msgMixedAlt())
+	f.selectInbox()
+
+	// SEARCH BODY should find text in plain text part
+	lines := f.cmd(`SEARCH BODY "attached report"`)
+	if !strings.Contains(lines[0], "SEARCH 1") {
+		t.Errorf("SEARCH BODY should find plain text content, got %q", lines[0])
+	}
+
+	// SEARCH should find text in HTML part too
+	lines2 := f.cmd(`SEARCH BODY "report"`)
+	if !strings.Contains(lines2[0], "SEARCH 1") {
+		t.Errorf("SEARCH BODY should find HTML content, got %q", lines2[0])
+	}
+
+	// SEARCH FROM
+	lines3 := f.cmd(`SEARCH FROM "carol@example.com"`)
+	if !strings.Contains(lines3[0], "SEARCH 1") {
+		t.Errorf("SEARCH FROM should find sender, got %q", lines3[0])
+	}
+
+	// SEARCH TO
+	lines4 := f.cmd(`SEARCH TO "tony@example.com"`)
+	if !strings.Contains(lines4[0], "SEARCH 1") {
+		t.Errorf("SEARCH TO should find recipient, got %q", lines4[0])
+	}
+
+	// SEARCH CC
+	lines5 := f.cmd(`SEARCH CC "bruce@example.com"`)
+	if !strings.Contains(lines5[0], "SEARCH 1") {
+		t.Errorf("SEARCH CC should find CC recipient, got %q", lines5[0])
+	}
+}
+
+func TestE2ERelatedBodyStructure(t *testing.T) {
+	f := newIMAPTest(t)
+	defer f.close()
+	f.login("u", "pass")
+	storeMsg(msgRelated())
+	f.selectInbox()
+
+	hdr, _, _, _ := f.fetchCmd(1, "BODYSTRUCTURE")
+	structure := hdr
+	t.Logf("BODYSTRUCTURE: %s", structure)
+
+	if !strings.Contains(structure, `"related"`) {
+		t.Errorf("expected multipart/related, got %q", structure)
+	}
+	if !strings.Contains(structure, `"html"`) {
+		t.Errorf("expected text/html child, got %q", structure)
+	}
+	if !strings.Contains(structure, `"png"`) {
+		t.Errorf("expected image/png child, got %q", structure)
+	}
+}
+
+func TestE2ERelatedFetchParts(t *testing.T) {
+	f := newIMAPTest(t)
+	defer f.close()
+	f.login("u", "pass")
+	storeMsg(msgRelated())
+	f.selectInbox()
+
+	// Part 1: text/html
+	_, lit1, _, _ := f.fetchCmd(1, "BODY[1]")
+	part1 := string(lit1)
+	if !strings.Contains(part1, "text/html") {
+		t.Errorf("part 1 should be text/html, got %q", part1)
+	}
+	if !strings.Contains(part1, "<img src=\"cid:photo.png\">") {
+		t.Errorf("part 1 should contain HTML with CID reference, got %q", part1)
+	}
+
+	// Part 2: image/png inline
+	_, lit2, _, _ := f.fetchCmd(1, "BODY[2]")
+	part2 := string(lit2)
+	if !strings.Contains(part2, "image/png") {
+		t.Errorf("part 2 should be image/png, got %q", part2)
+	}
+	if !strings.Contains(part2, "Content-ID: <photo.png@cid>") {
+		t.Errorf("part 2 should have Content-ID header, got %q", part2)
+	}
+	if !strings.Contains(part2, "inline") {
+		t.Errorf("part 2 should have Content-Disposition: inline, got %q", part2)
+	}
+}
+
+func TestE2EEmptyMailbox(t *testing.T) {
+	f := newIMAPTest(t)
+	defer f.close()
+	f.login("u", "pass")
+	f.selectInbox()
+
+	// SEARCH on empty mailbox should return empty
+	lines := f.cmd("SEARCH ALL")
+	if !strings.Contains(lines[0], "SEARCH") {
+		t.Errorf("SEARCH ALL on empty mailbox should return SEARCH, got %q", lines[0])
+	}
+	// Should not contain any numbers after "SEARCH"
+	parts := strings.SplitN(lines[0], "SEARCH", 2)
+	if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
+		t.Errorf("SEARCH ALL on empty mailbox should have no results, got %q", lines[0])
+	}
+}
+
+func TestE2EAppend(t *testing.T) {
+	f := newIMAPTest(t)
+	defer f.close()
+	f.login("u", "pass")
+
+	raw := msg("AppendRaw", "raw appended body")
+	tag := f.nextTag()
+	// LITERAL+ syntax: {N+} followed immediately by the data
+	f.write(fmt.Sprintf("%s APPEND \"INBOX\" {%d+}\r\n%s\r\n", tag, len(raw), raw))
+	resp := f.readLine()
+	if !strings.HasPrefix(resp, tag+" OK APPEND") {
+		t.Fatalf("APPEND failed, got %q", resp)
+	}
+
+	f.selectInbox()
+	lines := f.cmd("FETCH 1 (FLAGS UID)")
+	if !strings.HasPrefix(lines[0], "* 1 FETCH") {
+		t.Fatalf("expected FETCH response, got %q", lines[0])
+	}
+	if !strings.Contains(lines[0], "UID 1") {
+		t.Errorf("FETCH should contain UID 1, got %q", lines[0])
+	}
+}
+
+func TestE2EAppendWithFlagsAndDate(t *testing.T) {
+	f := newIMAPTest(t)
+	defer f.close()
+	f.login("u", "pass")
+
+	raw := msg("AppendFull", "full append")
+	tag := f.nextTag()
+	// APPEND with flags and date-time, using LITERAL+
+	f.write(fmt.Sprintf("%s APPEND \"INBOX\" (\\Seen \\Draft) \"13-Jun-2026 00:00:00 -0500\" {%d+}\r\n%s\r\n",
+		tag, len(raw), raw))
+	resp := f.readLine()
+	if !strings.HasPrefix(resp, tag+" OK APPEND") {
+		t.Fatalf("APPEND with flags/date failed, got %q", resp)
+	}
+
+	f.selectInbox()
+	lines := f.cmd("FETCH 1 (FLAGS)")
+	if !strings.Contains(lines[0], "\\Seen") {
+		t.Errorf("FETCH should contain \\Seen, got %q", lines[0])
+	}
+	if !strings.Contains(lines[0], "\\Draft") {
+		t.Errorf("FETCH should contain \\Draft, got %q", lines[0])
+	}
+}
+
+func TestE2EAppendToSent(t *testing.T) {
+	f := newIMAPTest(t)
+	defer f.close()
+	f.login("u", "pass")
+
+	raw := msg("AppendSent", "sent folder")
+	tag := f.nextTag()
+	f.write(fmt.Sprintf("%s APPEND \"Sent\" {%d+}\r\n%s\r\n", tag, len(raw), raw))
+	resp := f.readLine()
+	if !strings.HasPrefix(resp, tag+" OK APPEND") {
+		t.Fatalf("APPEND to Sent failed, got %q", resp)
+	}
+
+	tag2 := f.nextTag()
+	f.write(tag2 + " SELECT Sent\r\n")
+	var selectLast string
+	for {
+		l := f.readLine()
+		if strings.HasPrefix(l, tag2+" ") || strings.HasPrefix(l, tag2+"[") {
+			selectLast = l
+			break
+		}
+	}
+	if !strings.Contains(selectLast, "OK") {
+		t.Fatalf("SELECT Sent failed, got %q", selectLast)
+	}
+
+	lines := f.cmd("FETCH 1 (FLAGS)")
+	if !strings.HasPrefix(lines[0], "* 1 FETCH") {
+		t.Fatalf("expected message in Sent, got %q", lines[0])
+	}
+}
+
+func TestE2ECopy(t *testing.T) {
+	f := newIMAPTest(t)
+	defer f.close()
+	f.login("u", "pass")
+	storeMsg(msg("CopyE2E", "body"))
+	f.selectInbox()
+
+	lines := f.cmd("COPY 1 Sent")
+	last := lines[len(lines)-1]
+	if !strings.Contains(last, "OK COPY") {
+		t.Fatalf("COPY failed, got %q", last)
+	}
+
+	tag := f.nextTag()
+	f.write(tag + " SELECT Sent\r\n")
+	var selectLast string
+	for {
+		l := f.readLine()
+		if strings.HasPrefix(l, tag+" ") || strings.HasPrefix(l, tag+"[") {
+			selectLast = l
+			break
+		}
+	}
+	if !strings.Contains(selectLast, "OK") {
+		t.Fatalf("SELECT Sent failed, got %q", selectLast)
+	}
+
+	lines2 := f.cmd("FETCH 1 (FLAGS)")
+	if !strings.HasPrefix(lines2[0], "* 1 FETCH") {
+		t.Fatalf("expected copied message in Sent, got %q", lines2[0])
+	}
+}
+
+// TestE2EImaptestCommands exercises the exact command patterns that imaptest
+// uses, to ensure they all receive a proper tagged response.
+func TestE2EImaptestCommands(t *testing.T) {
+	f := newIMAPTest(t)
+	defer f.close()
+	f.login("u", "pass")
+
+	// Seed several messages so sequence ranges are valid.
+	for i := 0; i < 5; i++ {
+		storeMsg(msg(fmt.Sprintf("M%d", i), fmt.Sprintf("body%d", i)))
+	}
+
+	// STATUS (this previously loaded the whole mailbox and could hang).
+	lines := f.cmd("STATUS INBOX (MESSAGES UNSEEN RECENT)")
+	if !strings.Contains(lines[len(lines)-1], "OK STATUS") {
+		t.Fatalf("STATUS failed, got %q", lines[len(lines)-1])
+	}
+	if !strings.Contains(lines[0], "MESSAGES") {
+		t.Errorf("STATUS response missing MESSAGES, got %q", lines[0])
+	}
+
+	// SELECT and various FETCH forms used by imaptest.
+	f.selectInbox()
+
+	fetchCmds := []string{
+		"FETCH 1:3,5 (RFC822.SIZE UID BODY.PEEK[HEADER.FIELDS (Subject From)] BODY.PEEK[HEADER.FIELDS (Cc References From)])",
+		"FETCH 1:3,5 (RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (Cc References From)])",
+		"FETCH 1:3,5 (BODY.PEEK[HEADER.FIELDS (In-Reply-To Subject Message-ID)] ENVELOPE)",
+		"FETCH 1:3,5 (INTERNALDATE INTERNALDATE BODY.PEEK[HEADER.FIELDS (From)] BODY)",
+		"FETCH 1 (UID RFC822.HEADER)",
+		"FETCH 1:3,5 (INTERNALDATE BODY.PEEK[HEADER.FIELDS (References Cc Message-ID)] BODY.PEEK[HEADER.FIELDS (In-Reply-To In-Reply-To Cc In-Reply-To)])",
+	}
+	for _, cmd := range fetchCmds {
+		tag := f.nextTag()
+		f.write(tag + " " + cmd + "\r\n")
+		var last string
+		for {
+			l := f.readLine()
+			if strings.HasPrefix(l, tag+" ") || strings.HasPrefix(l, tag+"[") {
+				last = l
+				break
+			}
+		}
+		if !strings.Contains(last, "OK FETCH") {
+			t.Fatalf("%s failed, got %q", cmd, last)
+		}
+	}
+
+	// STORE +FLAGS and FLAGS.SILENT.
+	lines2 := f.cmd("STORE 1:3 +FLAGS (\\Deleted)")
+	if !strings.Contains(lines2[len(lines2)-1], "OK STORE") {
+		t.Fatalf("STORE +FLAGS failed, got %q", lines2[len(lines2)-1])
+	}
+	lines3 := f.cmd("STORE 1:2 +FLAGS.SILENT (\\Answered \\Draft)")
+	if !strings.Contains(lines3[len(lines3)-1], "OK STORE") {
+		t.Fatalf("STORE +FLAGS.SILENT failed, got %q", lines3[len(lines3)-1])
+	}
+
+	// EXPUNGE.
+	lines4 := f.cmd("EXPUNGE")
+	if !strings.Contains(lines4[len(lines4)-1], "OK EXPUNGE") {
+		t.Fatalf("EXPUNGE failed, got %q", lines4[len(lines4)-1])
+	}
+}
+
+func TestE2EAppendPreservesInternalDate(t *testing.T) {
+	f := newIMAPTest(t)
+	defer f.close()
+	f.login("u", "pass")
+
+	raw := msg("DateTest", "internal date test")
+	tag := f.nextTag()
+	// APPEND with a specific date-time
+	f.write(fmt.Sprintf("%s APPEND \"INBOX\" (\\Seen) \"15-Jun-2026 10:30:00 +0000\" {%d+}\r\n%s\r\n",
+		tag, len(raw), raw))
+	resp := f.readLine()
+	if !strings.HasPrefix(resp, tag+" OK APPEND") {
+		t.Fatalf("APPEND failed, got %q", resp)
+	}
+
+	f.selectInbox()
+	lines := f.cmd("FETCH 1 (FLAGS UID INTERNALDATE)")
+	fetch := lines[0]
+	if !strings.HasPrefix(fetch, "* 1 FETCH") {
+		t.Fatalf("expected FETCH response, got %q", fetch)
+	}
+	// Verify the date portion (day, month, year) matches, ignoring timezone
+	// since the server formats INTERNALDATE in its local timezone.
+	if !strings.Contains(fetch, "INTERNALDATE \"15-Jun-2026") {
+		t.Errorf("INTERNALDATE should be 15-Jun-2026, got %q", fetch)
 	}
 }

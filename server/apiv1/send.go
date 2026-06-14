@@ -18,6 +18,7 @@ import (
 	"github.com/PuerkitoBio/goquery"
 	"github.com/axllent/mailpit/config"
 	"github.com/axllent/mailpit/internal/smtpd"
+	"github.com/axllent/mailpit/internal/storage"
 	"github.com/axllent/mailpit/internal/tools"
 	"github.com/google/uuid"
 	"github.com/jhillyerd/enmime/v2"
@@ -311,8 +312,7 @@ func (d sendMessageParams) Send(remoteAddr string, httpAuthUser *string) (string
 
 	if d.Body.HTML != "" {
 		d.Body.HTML = convertDataURIToCID(d.Body.HTML, func(data []byte, contentType, cid string) {
-			ext := cidExt(contentType)
-			msg = msg.AddInline(data, contentType, "inline"+ext, cid)
+			msg = msg.AddInline(data, contentType, "inline"+cidExt(contentType), cid)
 		})
 		msg = msg.HTML([]byte(d.Body.HTML))
 	}
@@ -424,6 +424,20 @@ func (d sendMessageParams) Send(remoteAddr string, httpAuthUser *string) (string
 		return "", messageTooLargeError{size: int64(buff.Len()), limit: limit}
 	}
 
+	sentUserID := ""
+	if at := strings.LastIndex(parsedFrom.Address, "@"); at > 0 {
+		local := strings.ToLower(parsedFrom.Address[:at])
+		if plus := strings.IndexByte(local, '+'); plus >= 0 {
+			local = local[:plus]
+		}
+		candidate := local + strings.ToLower(parsedFrom.Address[at:])
+		if storage.IMAPUserExists(candidate) {
+			sentUserID = candidate
+		}
+	}
+	if sentUserID != "" {
+		return smtpd.SaveToDatabaseWithPlacement(ipAddr, d.Body.From.Email, addresses, buff.Bytes(), httpAuthUser, "Sent", sentUserID)
+	}
 	return smtpd.SaveToDatabase(ipAddr, d.Body.From.Email, addresses, buff.Bytes(), httpAuthUser)
 }
 
@@ -463,78 +477,51 @@ func validHeaderKey(s string) bool {
 	return true
 }
 
-// convertDataURIToCID scans HTML for <img> tags with data URIs, decodes them,
-// replaces the src with a cid: reference, and invokes addInline for each.
-// It returns the modified HTML.
+// convertDataURIToCID replaces embedded image data URLs with MIME inline attachments.
 func convertDataURIToCID(html string, addInline func(data []byte, contentType, cid string)) string {
-	if html == "" {
-		return html
-	}
-
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
 	if err != nil {
 		return html
 	}
 
 	modified := false
-	doc.Find("img[src]").Each(func(i int, s *goquery.Selection) {
-		src, exists := s.Attr("src")
-		if !exists || !strings.HasPrefix(src, "data:") {
+	doc.Find("img[src]").Each(func(_ int, image *goquery.Selection) {
+		src, _ := image.Attr("src")
+		if !strings.HasPrefix(src, "data:") {
+			return
+		}
+		comma := strings.IndexByte(src, ',')
+		if comma < 0 || !strings.Contains(src[:comma], ";base64") {
 			return
 		}
 
-		commaIdx := strings.Index(src, ",")
-		if commaIdx < 0 {
-			return
-		}
-
-		header := src[:commaIdx]
-		data := src[commaIdx+1:]
-
-		if !strings.Contains(header, ";base64") {
-			return
-		}
-
-		contentType := ""
-		if ctIdx := strings.Index(header, ":"); ctIdx >= 0 {
-			ctPart := header[ctIdx+1:]
-			if semiIdx := strings.Index(ctPart, ";"); semiIdx >= 0 {
-				contentType = ctPart[:semiIdx]
-			}
-		}
-
-		b, err := base64.StdEncoding.DecodeString(data)
+		data, err := base64.StdEncoding.DecodeString(src[comma+1:])
 		if err != nil {
 			return
 		}
-
+		contentType := ""
+		if colon := strings.IndexByte(src[:comma], ':'); colon >= 0 {
+			contentType = strings.TrimSuffix(strings.SplitN(src[colon+1:comma], ";", 2)[0], ";base64")
+		}
 		if contentType == "" {
-			contentType = http.DetectContentType(b)
+			contentType = http.DetectContentType(data)
 		}
 
-		cid := strings.ReplaceAll(uuid.New().String(), "-", "") + "@mailpit"
-
-		s.SetAttr("src", "cid:"+cid)
+		cid := strings.ReplaceAll(uuid.NewString(), "-", "") + "@mailpit"
+		image.SetAttr("src", "cid:"+cid)
 		modified = true
-
-		addInline(b, contentType, cid)
+		addInline(data, contentType, cid)
 	})
-
-	if modified {
-		body := doc.Find("body")
-		if body.Length() > 0 {
-			html, err = body.Html()
-			if err != nil {
-				return html
-			}
-		} else {
-			html, err = doc.Html()
-			if err != nil {
-				return html
-			}
-		}
+	if !modified {
+		return html
 	}
-
+	if body := doc.Find("body"); body.Length() > 0 {
+		if inner, err := body.Html(); err == nil {
+			return inner
+		}
+	} else if inner, err := doc.Html(); err == nil {
+		return inner
+	}
 	return html
 }
 

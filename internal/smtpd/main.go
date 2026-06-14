@@ -30,13 +30,90 @@ var (
 	errorResponse   = regexp.MustCompile(`^5\d\d `)
 )
 
-// MailHandler handles the incoming message to store in the database
-func mailHandler(origin net.Addr, from string, to []string, data []byte, smtpUser *string) (string, error) {
-	return SaveToDatabase(origin, from, to, data, smtpUser)
+// stripPlusAddress removes the +tag part from a local mailbox address.
+// e.g. "richard+tag@coverslide.me" → "richard@coverslide.me"
+func stripPlusAddress(email string) string {
+	at := strings.LastIndex(email, "@")
+	if at < 0 {
+		return email
+	}
+	local := email[:at]
+	plus := strings.Index(local, "+")
+	if plus >= 0 {
+		local = local[:plus]
+	}
+	return local + email[at:]
 }
 
-// SaveToDatabase will attempt to save a message to the database
+// MailHandler handles the incoming message to store in the database.
+// For IMAP users, separate copies are stored tagged to each user:
+// - Sender gets a copy in Sent (UserID=sender, Folder="Sent")
+// - Each IMAP recipient gets a copy in INBOX (UserID=recipient, Folder="")
+// - Non-IMAP addresses get a shared copy (UserID="", Folder="") for the web UI.
+// Plus-addresses (user+tag@host) are resolved to the base user for IMAP matching.
+func mailHandler(origin net.Addr, from string, to []string, data []byte, smtpUser *string) (string, error) {
+	senderAddr, _ := mail.ParseAddress(from)
+	senderEmail := ""
+	if senderAddr != nil {
+		senderEmail = strings.ToLower(strings.TrimSpace(senderAddr.Address))
+	}
+	senderBase := stripPlusAddress(senderEmail)
+	senderIsIMAP := senderBase != "" && storage.IMAPUserExists(senderBase)
+
+	// Track whether we stored any per-user copies
+	storedPerUser := false
+	var lastID string
+	var lastErr error
+
+	// Store a copy for each IMAP recipient in their INBOX
+	for _, addr := range to {
+		parsed, err := mail.ParseAddress(addr)
+		if err != nil {
+			continue
+		}
+		email := strings.ToLower(strings.TrimSpace(parsed.Address))
+		base := stripPlusAddress(email)
+		if base != "" && storage.IMAPUserExists(base) {
+			id, err := SaveToDatabaseWithPlacement(origin, from, to, data, smtpUser, "", base)
+			if err != nil {
+				lastErr = err
+			} else {
+				lastID = id
+				storedPerUser = true
+			}
+		}
+	}
+
+	// Store a Sent copy for the IMAP sender
+	if senderIsIMAP {
+		id, err := SaveToDatabaseWithPlacement(origin, from, to, data, smtpUser, "Sent", senderBase)
+		if err != nil {
+			lastErr = err
+		} else {
+			lastID = id
+			storedPerUser = true
+		}
+	}
+
+	// If no IMAP users were involved, store a shared copy for the web UI
+	if !storedPerUser {
+		id, err := SaveToDatabaseWithPlacement(origin, from, to, data, smtpUser, "", "")
+		if err != nil {
+			return "", err
+		}
+		return id, nil
+	}
+
+	return lastID, lastErr
+}
+
+// SaveToDatabase will attempt to save a message to the shared mailbox.
 func SaveToDatabase(origin net.Addr, from string, to []string, data []byte, smtpUser *string) (string, error) {
+	return SaveToDatabaseWithPlacement(origin, from, to, data, smtpUser, "", "")
+}
+
+// SaveToDatabaseWithPlacement saves a message in the specified IMAP folder and user mailbox.
+func SaveToDatabaseWithPlacement(origin net.Addr, from string, to []string, data []byte, smtpUser *string, folder, userID string) (string, error) {
 	if config.SMTPStrictRFCHeaders {
 		// reject headers which are not as RFC 5322 has them: line breaks which are not <CR><LF> (<CR><CR><LF> or
 		// <LF>), a <CR> on its own, and whitespace between the name of a header and its colon
@@ -55,7 +132,6 @@ func SaveToDatabase(origin net.Addr, from string, to []string, data []byte, smtp
 		// made <CR><LF> when it is sent on.
 		data, _ = tools.NormaliseHeaders(data)
 	}
-
 	msg, err := mail.ReadMessage(bytes.NewReader(data))
 	if err != nil {
 		logger.Log().Warnf("[smtpd] error parsing message: %s", err.Error())
@@ -153,7 +229,7 @@ func SaveToDatabase(origin net.Addr, from string, to []string, data []byte, smtp
 		logger.Log().Debugf("[smtpd] added missing addresses to Bcc header: %s", strings.Join(missingAddresses, ", "))
 	}
 
-	id, err := storeWithinBudget(&data, smtpUser)
+	id, err := storeWithinBudget(&data, smtpUser, folder, userID)
 	if err != nil {
 		logger.Log().Errorf("[db] error storing message: %s", err.Error())
 		return "", err
@@ -190,7 +266,7 @@ var (
 
 // storeWithinBudget stores the message when there is room for it in the budget, waiting for its turn if
 // there is not. The sender is told to try again later (a temporary failure) if it waits too long.
-func storeWithinBudget(data *[]byte, smtpUser *string) (string, error) {
+func storeWithinBudget(data *[]byte, smtpUser *string, folder string, userID ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), ingestWait)
 	defer cancel()
 
@@ -202,7 +278,8 @@ func storeWithinBudget(data *[]byte, smtpUser *string) (string, error) {
 	}
 	defer release()
 
-	return storage.Store(data, smtpUser)
+	placement := append([]string{folder}, userID...)
+	return storage.Store(data, smtpUser, placement...)
 }
 
 // maxReasonLength is the longest reason (from the error of the parser) which is sent to the client.
