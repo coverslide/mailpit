@@ -27,7 +27,7 @@ func TestTags(t *testing.T) {
 		ids := []string{}
 
 		for range 10 {
-			id, err := Store(&testMimeEmail, nil)
+			id, err := Store(&testMimeEmail, nil, "")
 			if err != nil {
 				t.Log("error ", err)
 				t.Fail()
@@ -60,7 +60,7 @@ func TestTags(t *testing.T) {
 		}
 
 		// test 20 tags
-		id, err := Store(&testMimeEmail, nil)
+		id, err := Store(&testMimeEmail, nil, "")
 		if err != nil {
 			t.Log("error ", err)
 			t.Fail()
@@ -127,7 +127,7 @@ func TestTags(t *testing.T) {
 		}
 
 		// test 20 tags
-		id, err = Store(&testTagEmail, nil)
+		id, err = Store(&testTagEmail, nil, "")
 		if err != nil {
 			t.Log("error ", err)
 			t.Fail()
@@ -152,7 +152,7 @@ func TestUsernameAutoTagging(t *testing.T) {
 
 	t.Run("Auto-tagging enabled", func(t *testing.T) {
 		config.TagsUsername = true
-		id, err := Store(&testTextEmail, &username)
+		id, err := Store(&testTextEmail, &username, "")
 		if err != nil {
 			t.Fatalf("Store failed: %v", err)
 		}
@@ -168,7 +168,7 @@ func TestUsernameAutoTagging(t *testing.T) {
 
 	t.Run("Auto-tagging disabled", func(t *testing.T) {
 		config.TagsUsername = false
-		id, err := Store(&testTextEmail, &username)
+		id, err := Store(&testTextEmail, &username, "")
 		if err != nil {
 			t.Fatalf("Store failed: %v", err)
 		}

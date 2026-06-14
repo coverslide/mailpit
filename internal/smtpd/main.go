@@ -30,11 +30,13 @@ var (
 
 // MailHandler handles the incoming message to store in the database
 func mailHandler(origin net.Addr, from string, to []string, data []byte, smtpUser *string) (string, error) {
-	return SaveToDatabase(origin, from, to, data, smtpUser)
+	return SaveToDatabase(origin, from, to, data, smtpUser, "")
 }
 
-// SaveToDatabase will attempt to save a message to the database
-func SaveToDatabase(origin net.Addr, from string, to []string, data []byte, smtpUser *string) (string, error) {
+// SaveToDatabase will attempt to save a message to the database.
+// The folder parameter controls which IMAP folder the message appears in
+// (empty string for INBOX, "Sent" for Sent, etc.).
+func SaveToDatabase(origin net.Addr, from string, to []string, data []byte, smtpUser *string, folder string) (string, error) {
 	if !config.SMTPStrictRFCHeaders && bytes.Contains(data, []byte("\r\r\n")) {
 		// replace all <CR><CR><LF> (\r\r\n) with <CR><LF> (\r\n)
 		// @see https://github.com/axllent/mailpit/issues/87 & https://github.com/axllent/mailpit/issues/153
@@ -137,7 +139,7 @@ func SaveToDatabase(origin net.Addr, from string, to []string, data []byte, smtp
 		logger.Log().Debugf("[smtpd] added missing addresses to Bcc header: %s", strings.Join(missingAddresses, ", "))
 	}
 
-	id, err := storage.Store(&data, smtpUser)
+	id, err := storage.Store(&data, smtpUser, folder)
 	if err != nil {
 		logger.Log().Errorf("[db] error storing message: %s", err.Error())
 		return "", err

@@ -58,7 +58,7 @@ func GetMessages(w http.ResponseWriter, r *http.Request) {
 
 	start, beforeTS, limit := getStartLimit(r)
 
-	messages, err := storage.List(start, beforeTS, limit)
+	messages, err := storage.List(start, beforeTS, limit, "")
 	if err != nil {
 		httpError(w, err.Error())
 		return

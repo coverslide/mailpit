@@ -17,7 +17,7 @@ func TestTextEmailInserts(t *testing.T) {
 	start := time.Now()
 
 	for range testRuns {
-		if _, err := Store(&testTextEmail, nil); err != nil {
+		if _, err := Store(&testTextEmail, nil, ""); err != nil {
 			t.Log("error ", err)
 			t.Fail()
 		}
@@ -55,7 +55,7 @@ func TestMimeEmailInserts(t *testing.T) {
 		start := time.Now()
 
 		for range testRuns {
-			if _, err := Store(&testMimeEmail, nil); err != nil {
+			if _, err := Store(&testMimeEmail, nil, ""); err != nil {
 				t.Log("error ", err)
 				t.Fail()
 			}
@@ -95,7 +95,7 @@ func TestRetrieveMimeEmail(t *testing.T) {
 				t.Logf("Testing mime email retrieval (tenant %s)", tenantID)
 			}
 
-			id, err := Store(&testMimeEmail, nil)
+			id, err := Store(&testMimeEmail, nil, "")
 			if err != nil {
 				t.Log("error ", err)
 				t.Fail()
@@ -152,12 +152,12 @@ func TestMessageSummary(t *testing.T) {
 			t.Logf("Testing message summary (tenant %s)", tenantID)
 		}
 
-		if _, err := Store(&testMimeEmail, nil); err != nil {
+		if _, err := Store(&testMimeEmail, nil, ""); err != nil {
 			t.Log("error ", err)
 			t.Fail()
 		}
 
-		summaries, err := List(0, 0, 1)
+		summaries, err := List(0, 0, 1, "")
 		if err != nil {
 			t.Log("error ", err)
 			t.Fail()
@@ -186,7 +186,7 @@ func BenchmarkImportText(b *testing.B) {
 	defer Close()
 
 	for i := 0; i < b.N; i++ {
-		if _, err := Store(&testTextEmail, nil); err != nil {
+		if _, err := Store(&testTextEmail, nil, ""); err != nil {
 			b.Log("error ", err)
 			b.Fail()
 		}
@@ -198,7 +198,7 @@ func BenchmarkImportMime(b *testing.B) {
 	defer Close()
 
 	for i := 0; i < b.N; i++ {
-		if _, err := Store(&testMimeEmail, nil); err != nil {
+		if _, err := Store(&testMimeEmail, nil, ""); err != nil {
 			b.Log("error ", err)
 			b.Fail()
 		}
@@ -215,7 +215,7 @@ func TestInlineImageContentIdHandling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to read test email: %v", err)
 	}
-	storedMessage, err := Store(&inlineAttachment, nil)
+	storedMessage, err := Store(&inlineAttachment, nil, "")
 	if err != nil {
 		t.Fatal("Failed to store test case 1:", err)
 	}
@@ -245,7 +245,7 @@ func TestRegularAttachmentHandling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to read test email: %v", err)
 	}
-	storedMessage, err := Store(&regularAttachment, nil)
+	storedMessage, err := Store(&regularAttachment, nil, "")
 	if err != nil {
 		t.Fatal("Failed to store test case 3:", err)
 	}
@@ -279,7 +279,7 @@ func TestMixedAttachmentHandling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to read test email: %v", err)
 	}
-	storedMessage, err := Store(&mixedAttachment, nil)
+	storedMessage, err := Store(&mixedAttachment, nil, "")
 	if err != nil {
 		t.Fatal("Failed to store test case 4:", err)
 	}
@@ -299,5 +299,33 @@ func TestMixedAttachmentHandling(t *testing.T) {
 	}
 	if msg.Attachments[0].ContentID != "" {
 		t.Errorf("Test case 4: Expected attachment ContentID to be empty, got '%s'", msg.Attachments[0].ContentID)
+	}
+}
+
+func TestMailboxCounts(t *testing.T) {
+	setup("")
+	defer Close()
+
+	body := []byte("From: a@b.com\r\nTo: c@d.com\r\nSubject: one\r\n\r\nbody")
+	if _, err := Store(&body, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	body2 := []byte("From: a@b.com\r\nTo: c@d.com\r\nSubject: two\r\n\r\nbody")
+	if _, err := Store(&body2, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	total, unread, nextUID, err := MailboxCounts("")
+	if err != nil {
+		t.Fatalf("MailboxCounts error: %v", err)
+	}
+	if total != 2 {
+		t.Errorf("expected total 2, got %d", total)
+	}
+	if unread != 2 {
+		t.Errorf("expected unread 2, got %d", unread)
+	}
+	if nextUID != 3 {
+		t.Errorf("expected nextUID 3, got %d", nextUID)
 	}
 }

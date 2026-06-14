@@ -29,8 +29,9 @@ import (
 
 // Store will save an email to the database tables.
 // The username is the authentication username of either the SMTP or HTTP client (blank for none).
+// The folder is the IMAP folder to store the message in (empty string for INBOX, "Sent", "Trash", "Drafts").
 // Returns the database ID of the saved message.
-func Store(body *[]byte, username *string) (string, error) {
+func Store(body *[]byte, username *string, folder string) (string, error) {
 	parser := enmime.NewParser(enmime.DisableCharacterDetection(true))
 
 	// Parse message body with enmime
@@ -98,13 +99,13 @@ func Store(body *[]byte, username *string) (string, error) {
 	snippet := tools.CreateSnippet(env.Text, env.HTML)
 
 	sql := fmt.Sprintf(`INSERT INTO %s 
-    	(Created, ID, MessageID, Subject, Metadata, Size, Inline, Attachments, SearchText, Read, Snippet) 
-	    VALUES(?,?,?,?,?,?,?,?,?,0,?)`,
+    	(Created, ID, MessageID, Subject, Metadata, Size, Inline, Attachments, SearchText, Read, Snippet, Folder) 
+	    VALUES(?,?,?,?,?,?,?,?,?,0,?,?)`,
 		tenant("mailbox"),
 	) // #nosec
 
 	// insert mail summary data
-	_, err = tx.Exec(sql, created.UnixMilli(), id, messageID, subject, string(summaryJSON), size, inline, attachments, searchText, snippet)
+	_, err = tx.Exec(sql, created.UnixMilli(), id, messageID, subject, string(summaryJSON), size, inline, attachments, searchText, snippet, folder)
 	if err != nil {
 		return "", err
 	}
@@ -210,15 +211,30 @@ func Store(body *[]byte, username *string) (string, error) {
 	return id, nil
 }
 
+// UpdateCreated overrides the Created timestamp for a stored message.
+// Used by IMAP APPEND to preserve the client-provided date-time.
+func UpdateCreated(id string, t time.Time) error {
+	q := fmt.Sprintf("UPDATE %s SET Created = ? WHERE ID = ?", tenant("mailbox"))
+	_, err := db.Exec(q, t.UnixMilli(), id)
+	return err
+}
+
 // List returns a subset of messages from the mailbox,
-// sorted latest to oldest
-func List(start int, beforeTS int64, limit int) ([]MessageSummary, error) {
+// sorted latest to oldest.
+// Pass folder="" for INBOX (default), "Sent", "Trash", or "Drafts".
+func List(start int, beforeTS int64, limit int, folder string) ([]MessageSummary, error) {
 	results := []MessageSummary{}
 	tsStart := time.Now()
 
 	q := sqlf.From(tenant("mailbox") + " m").
 		Select(`m.Created, m.ID, m.MessageID, m.Subject, m.Metadata, m.Size, m.Attachments, m.Read, m.Snippet`).
-		OrderBy("m.Created DESC")
+		OrderBy("m.Created DESC, m.rowid DESC")
+
+	if folder != "" {
+		q = q.Where("m.Folder = ?", folder)
+	} else {
+		q = q.Where("m.Folder = ''")
+	}
 
 	if limit > 0 {
 		q = q.Limit(limit).Offset(start)
@@ -300,6 +316,35 @@ func List(start int, beforeTS int64, limit int) ([]MessageSummary, error) {
 	logger.Log().Debugf("[db] list INBOX in %s", elapsed)
 
 	return results, nil
+}
+
+// MailboxCounts returns the total, unread, and next UID for a folder.
+// Pass folder="" for INBOX.
+func MailboxCounts(folder string) (total, unread, nextUID int64, err error) {
+	var totalF, unreadF float64
+
+	q := sqlf.From(tenant("mailbox")).Select("COUNT(*)").To(&totalF)
+	if folder != "" {
+		q = q.Where("Folder = ?", folder)
+	} else {
+		q = q.Where("Folder = ''")
+	}
+	if err = q.QueryRowAndClose(context.TODO(), db); err != nil {
+		return 0, 0, 1, err
+	}
+
+	q2 := sqlf.From(tenant("mailbox")).Select("COUNT(*)").To(&unreadF).
+		Where("Read = ?", 0)
+	if folder != "" {
+		q2 = q2.Where("Folder = ?", folder)
+	} else {
+		q2 = q2.Where("Folder = ''")
+	}
+	if err = q2.QueryRowAndClose(context.TODO(), db); err != nil {
+		return 0, 0, 1, err
+	}
+
+	return int64(totalF), int64(unreadF), int64(totalF) + 1, nil
 }
 
 // GetMessage returns a Message generated from the mailbox_data collection.
@@ -545,7 +590,7 @@ func LatestID(r *http.Request) (string, error) {
 			return "", err
 		}
 	} else {
-		messages, err = List(0, 0, 1)
+		messages, err = List(0, 0, 1, "")
 		if err != nil {
 			return "", err
 		}
@@ -766,6 +811,7 @@ func DeleteMessages(ids []string) error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = tx.Rollback() }()
 
 	args = make([]any, len(toDelete))
 	for i, id := range toDelete {

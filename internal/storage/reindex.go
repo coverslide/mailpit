@@ -42,97 +42,13 @@ func ReindexAll() {
 
 	logger.Log().Infof("reindexing %d messages", total)
 
-	type updateStruct struct {
-		// ID in database
-		ID string
-		// SearchText for searching
-		SearchText string
-		// Snippet for UI
-		Snippet string
-		// Metadata info
-		Metadata string
-	}
-
 	parser := enmime.NewParser(enmime.DisableCharacterDetection(true))
 
 	for _, ids := range chunks {
-		updates := []updateStruct{}
-
-		for _, id := range ids {
-			raw, err := GetMessageRaw(id)
-			if err != nil {
-				logger.Log().Error(err)
-				continue
-			}
-
-			r := bytes.NewReader(raw)
-
-			env, err := parser.ReadEnvelope(r)
-			if err != nil {
-				logger.Log().Errorf("[message] %s", err.Error())
-				continue
-			}
-
-			meta, _ := GetMetadata(id)
-
-			fromJSON := addressToSlice(env, "From")
-			if len(fromJSON) > 0 {
-				meta.From = fromJSON[0]
-			} else if env.GetHeader("From") != "" {
-				meta.From = &mail.Address{Name: env.GetHeader("From")}
-			} else {
-				meta.From = nil
-			}
-			meta.To = addressToSlice(env, "To")
-			meta.Cc = addressToSlice(env, "Cc")
-			meta.Bcc = addressToSlice(env, "Bcc")
-			meta.ReplyTo = addressToSlice(env, "Reply-To")
-
-			MetadataJSON, err := json.Marshal(meta)
-			if err != nil {
-				logger.Log().Errorf("[message] %s", err.Error())
-				continue
-			}
-
-			searchText := createSearchText(env)
-			snippet := tools.CreateSnippet(env.Text, env.HTML)
-
-			u := updateStruct{}
-			u.ID = id
-			u.SearchText = searchText
-			u.Snippet = snippet
-			u.Metadata = string(MetadataJSON)
-
-			updates = append(updates, u)
-		}
-
-		ctx := context.Background()
-		tx, err := db.BeginTx(ctx, nil)
-		if err != nil {
+		if err := reindexChunk(ids, &finished, total, parser); err != nil {
 			logger.Log().Errorf("[db] %s", err.Error())
 			continue
 		}
-
-		// roll back if it fails
-		defer func() { _ = tx.Rollback() }()
-
-		// insert mail summary data
-		for _, u := range updates {
-			_, err = tx.Exec(fmt.Sprintf(`UPDATE %s SET SearchText = ?, Snippet = ?, Metadata = ? WHERE ID = ?`, tenant("mailbox")), u.SearchText, u.Snippet, u.Metadata, u.ID)
-			if err != nil {
-				logger.Log().Errorf("[db] %s", err.Error())
-				continue
-			}
-		}
-
-		if err := tx.Commit(); err != nil {
-			logger.Log().Errorf("[db] %s", err.Error())
-			continue
-		}
-
-		finished += len(updates)
-
-		logger.Log().Printf("reindexed: %d / %d (%d%%)", finished, total, finished*100/total)
 	}
 }
 
@@ -142,4 +58,90 @@ func chunkBy[T any](items []T, chunkSize int) (chunks [][]T) {
 	}
 
 	return append(chunks, items)
+}
+
+type updateStruct struct {
+	// ID in database
+	ID string
+	// SearchText for searching
+	SearchText string
+	// Snippet for UI
+	Snippet string
+	// Metadata info
+	Metadata string
+}
+
+func reindexChunk(ids []string, finished *int, total int, parser *enmime.Parser) error {
+	updates := []updateStruct{}
+
+	for _, id := range ids {
+		raw, err := GetMessageRaw(id)
+		if err != nil {
+			logger.Log().Error(err)
+			continue
+		}
+
+		r := bytes.NewReader(raw)
+
+		env, err := parser.ReadEnvelope(r)
+		if err != nil {
+			logger.Log().Errorf("[message] %s", err.Error())
+			continue
+		}
+
+		meta, _ := GetMetadata(id)
+
+		fromJSON := addressToSlice(env, "From")
+		if len(fromJSON) > 0 {
+			meta.From = fromJSON[0]
+		} else if env.GetHeader("From") != "" {
+			meta.From = &mail.Address{Name: env.GetHeader("From")}
+		} else {
+			meta.From = nil
+		}
+		meta.To = addressToSlice(env, "To")
+		meta.Cc = addressToSlice(env, "Cc")
+		meta.Bcc = addressToSlice(env, "Bcc")
+		meta.ReplyTo = addressToSlice(env, "Reply-To")
+
+		MetadataJSON, err := json.Marshal(meta)
+		if err != nil {
+			logger.Log().Errorf("[message] %s", err.Error())
+			continue
+		}
+
+		searchText := createSearchText(env)
+		snippet := tools.CreateSnippet(env.Text, env.HTML)
+
+		u := updateStruct{}
+		u.ID = id
+		u.SearchText = searchText
+		u.Snippet = snippet
+		u.Metadata = string(MetadataJSON)
+
+		updates = append(updates, u)
+	}
+
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	for _, u := range updates {
+		_, err = tx.Exec(fmt.Sprintf(`UPDATE %s SET SearchText = ?, Snippet = ?, Metadata = ? WHERE ID = ?`, tenant("mailbox")), u.SearchText, u.Snippet, u.Metadata, u.ID)
+		if err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	*finished += len(updates)
+	logger.Log().Printf("reindexed: %d / %d (%d%%)", *finished, total, *finished*100/total)
+
+	return nil
 }

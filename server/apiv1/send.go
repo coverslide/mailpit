@@ -205,7 +205,7 @@ func (d sendMessageParams) Send(remoteAddr string, httpAuthUser *string) (string
 		return "", fmt.Errorf("error building message: %s", err.Error())
 	}
 
-	return smtpd.SaveToDatabase(ipAddr, d.Body.From.Email, addresses, buff.Bytes(), httpAuthUser)
+	return smtpd.SaveToDatabase(ipAddr, d.Body.From.Email, addresses, buff.Bytes(), httpAuthUser, "Sent")
 }
 
 // convertDataURIToCID scans HTML for <img> tags with data URIs, decodes them,
