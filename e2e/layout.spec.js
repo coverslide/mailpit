@@ -1,4 +1,9 @@
 import { expect, test } from "@playwright/test";
+import { clearMailbox } from "./helpers.js";
+
+test.beforeEach(async ({ request }) => {
+	await clearMailbox(request);
+});
 
 test("desktop mailbox layout fits the viewport and shows the mailbox navigation", async ({ page }) => {
 	await page.setViewportSize({ width: 1440, height: 900 });

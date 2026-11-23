@@ -74,7 +74,6 @@ export default {
 	},
 
 	methods: {
-
 		prefillReply() {
 			if (!this.message) return;
 
@@ -178,25 +177,27 @@ export default {
 			const editor = document.getElementById("ComposeEditor");
 			if (!editor || this.quill) return;
 
-			this.quill = markRaw(new Quill(editor, {
-				theme: "snow",
-				modules: {
-					toolbar: {
-						container: [
-							[{ header: [1, 2, 3, false] }],
-							["bold", "italic", "underline", "strike"],
-							[{ list: "ordered" }, { list: "bullet" }],
-							["blockquote", "code-block"],
-							["link", "image"],
-							["clean"],
-						],
-						handlers: {
-							image: () => this.quillImageHandler(),
+			this.quill = markRaw(
+				new Quill(editor, {
+					theme: "snow",
+					modules: {
+						toolbar: {
+							container: [
+								[{ header: [1, 2, 3, false] }],
+								["bold", "italic", "underline", "strike"],
+								[{ list: "ordered" }, { list: "bullet" }],
+								["blockquote", "code-block"],
+								["link", "image"],
+								["clean"],
+							],
+							handlers: {
+								image: () => this.quillImageHandler(),
+							},
 						},
 					},
-				},
-				placeholder: "Compose your message...",
-			}));
+					placeholder: "Compose your message...",
+				}),
+			);
 		},
 
 		getQuillHTML() {
@@ -272,7 +273,7 @@ export default {
 			if (this.originalMessageID) {
 				sendPayload.Headers = {
 					"In-Reply-To": this.originalMessageID,
-					"References": this.originalMessageID,
+					References: this.originalMessageID,
 				};
 			}
 
@@ -429,7 +430,11 @@ export default {
 								type="text"
 								class="form-control form-control-sm"
 								placeholder="sender@example.com"
-								:readonly="mode !== 'compose' && mailbox.uiConfig.MessageRelay && mailbox.uiConfig.MessageRelay.OverrideFrom !== ''"
+								:readonly="
+									mode !== 'compose' &&
+									mailbox.uiConfig.MessageRelay &&
+									mailbox.uiConfig.MessageRelay.OverrideFrom !== ''
+								"
 							/>
 						</div>
 					</div>
@@ -458,63 +463,75 @@ export default {
 					<div class="mb-2 row">
 						<label class="col-sm-2 col-form-label text-body-secondary">Bcc</label>
 						<div class="col-sm-10">
-							<input v-model="bccInput" type="text" class="form-control form-control-sm" placeholder="bcc@example.com" />
+							<input
+								v-model="bccInput"
+								type="text"
+								class="form-control form-control-sm"
+								placeholder="bcc@example.com"
+							/>
 						</div>
 					</div>
 					<div class="mb-2 row">
 						<label class="col-sm-2 col-form-label text-body-secondary">Subject</label>
 						<div class="col-sm-10">
-							<input v-model="subject" type="text" class="form-control form-control-sm" placeholder="Subject" />
-						</div>
-					</div>
-			<div class="mb-2 row align-items-start">
-				<label class="col-sm-2 col-form-label text-body-secondary">Message</label>
-				<div class="col-sm-10">
-					<div
-						id="ComposeEditor"
-						class="quill-editor"
-						style="min-height: 250px; max-height: 50vh; overflow-y: auto"
-					></div>
-					<div v-if="imageProcessing" class="mt-1 text-body-secondary small">
-						<i class="bi bi-hourglass-split me-1"></i>Processing image...
-					</div>
-				</div>
-			</div>
-			<div class="mb-2 row align-items-start">
-				<label class="col-sm-2 col-form-label text-body-secondary">Attachments</label>
-				<div class="col-sm-10">
-					<div v-if="attachments.length" class="mb-2">
-						<div
-							v-for="(att, idx) in attachments"
-							:key="idx"
-							class="d-inline-flex align-items-center border rounded px-2 py-1 me-1 mb-1 bg-light"
-						>
-							<i class="bi bi-paperclip me-1 text-body-secondary"></i>
-							<span class="small">{{ att.name }} ({{ formatFileSize(att.size) }})</span>
-							<button
-								type="button"
-								class="btn-close btn-close-sm ms-2"
-								style="font-size: 0.6em"
-								aria-label="Remove"
-								@click="removeAttachment(idx)"
-							></button>
-						</div>
-					</div>
-					<div>
-						<label class="btn btn-outline-secondary btn-sm">
-							<i class="bi bi-paperclip me-1"></i>Attach files
 							<input
-								type="file"
-								multiple
-								class="d-none"
-								@change="handleAttachmentUpload($event)"
+								v-model="subject"
+								type="text"
+								class="form-control form-control-sm"
+								placeholder="Subject"
 							/>
-						</label>
-						<small class="text-body-secondary ms-2">Attachments are sent as regular email attachments</small>
+						</div>
+					</div>
+					<div class="mb-2 row align-items-start">
+						<label class="col-sm-2 col-form-label text-body-secondary">Message</label>
+						<div class="col-sm-10">
+							<div
+								id="ComposeEditor"
+								class="quill-editor"
+								style="min-height: 250px; max-height: 50vh; overflow-y: auto"
+							></div>
+							<div v-if="imageProcessing" class="mt-1 text-body-secondary small">
+								<i class="bi bi-hourglass-split me-1"></i>Processing image...
+							</div>
+						</div>
+					</div>
+					<div class="mb-2 row align-items-start">
+						<label class="col-sm-2 col-form-label text-body-secondary">Attachments</label>
+						<div class="col-sm-10">
+							<div v-if="attachments.length" class="mb-2">
+								<div
+									v-for="(att, idx) in attachments"
+									:key="idx"
+									class="d-inline-flex align-items-center border rounded px-2 py-1 me-1 mb-1 bg-light"
+								>
+									<i class="bi bi-paperclip me-1 text-body-secondary"></i>
+									<span class="small">{{ att.name }} ({{ formatFileSize(att.size) }})</span>
+									<button
+										type="button"
+										class="btn-close btn-close-sm ms-2"
+										style="font-size: 0.6em"
+										aria-label="Remove"
+										@click="removeAttachment(idx)"
+									></button>
+								</div>
+							</div>
+							<div>
+								<label class="btn btn-outline-secondary btn-sm">
+									<i class="bi bi-paperclip me-1"></i>Attach files
+									<input
+										type="file"
+										multiple
+										class="d-none"
+										@change="handleAttachmentUpload($event)"
+									/>
+								</label>
+								<small class="text-body-secondary ms-2"
+									>Attachments are sent as regular email attachments</small
+								>
+							</div>
+						</div>
 					</div>
 				</div>
-			</div>
-		</div>
 				<div class="modal-footer">
 					<button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
 					<button type="button" class="btn btn-primary" :disabled="sending" @click="sendMessage">

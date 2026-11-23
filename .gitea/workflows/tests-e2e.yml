@@ -1,0 +1,28 @@
+name: Tests (e2e)
+on:
+  pull_request:
+    branches: [develop, 'feature/**', 'imap-support*', 'richard-develop']
+  push:
+    branches: [develop, 'feature/**', 'imap-support*', 'richard-develop']
+jobs:
+  test-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install JavaScript dependencies
+        run: npm ci
+      - name: Build the UI and Mailpit binary
+        run: |
+          npm run package
+          go build -o mailpit .
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium-headless-shell
+      - name: Run end-to-end tests
+        run: npm run test:e2e

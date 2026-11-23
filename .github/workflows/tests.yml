@@ -1,9 +1,9 @@
 name: Tests
 on:
   pull_request:
-    branches: [ develop, 'feature/**', 'imap-support*' ]
+    branches: [ develop, 'feature/**', 'imap-support*', 'richard-develop' ]
   push:
-    branches: [ develop, 'feature/**', 'imap-support*' ]
+    branches: [ develop, 'feature/**', 'imap-support*', 'richard-develop' ]
 jobs:
   test:
     strategy:

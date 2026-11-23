@@ -273,11 +273,7 @@ export default {
 		</div>
 	</div>
 
-	<Compose
-		v-if="mailbox.uiConfig.MessageRelay && loadComposeModal"
-		ref="ComposeRef"
-		:mode="'compose'"
-	/>
+	<Compose v-if="mailbox.uiConfig.MessageRelay && loadComposeModal" ref="ComposeRef" :mode="'compose'" />
 	<NavMailbox modals @load-messages="loadMessages" />
 	<About modals />
 	<AjaxLoader :loading="loading" />

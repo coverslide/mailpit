@@ -523,9 +523,9 @@ func extractContentTypeParams(text string) string {
 				}
 				kv := strings.SplitN(p, "=", 2)
 				if len(kv) == 2 {
-				k := strings.TrimSpace(strings.ToLower(kv[0]))
-				v := strings.Trim(strings.TrimSpace(kv[1]), "\"")
-				kvs = append(kvs, fmt.Sprintf("\"%s\" %s", k, nilOrString(v)))
+					k := strings.TrimSpace(strings.ToLower(kv[0]))
+					v := strings.Trim(strings.TrimSpace(kv[1]), "\"")
+					kvs = append(kvs, fmt.Sprintf("\"%s\" %s", k, nilOrString(v)))
 				}
 			}
 			if len(kvs) > 0 {

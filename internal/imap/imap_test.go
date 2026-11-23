@@ -19,10 +19,10 @@ import (
 
 func TestParseImapCommand(t *testing.T) {
 	tests := []struct {
-		line     string
-		tag      string
-		cmd      string
-		argsLen  int
+		line    string
+		tag     string
+		cmd     string
+		argsLen int
 	}{
 		{"a001 LOGIN user pass", "a001", "LOGIN", 2},
 		{"a002 SELECT INBOX", "a002", "SELECT", 1},
@@ -268,11 +268,11 @@ func TestHasFlag(t *testing.T) {
 
 func TestParsePartialRange(t *testing.T) {
 	tests := []struct {
-		attr       string
-		wantBase   string
-		wantOff    int
-		wantSize   int
-		wantHas    bool
+		attr     string
+		wantBase string
+		wantOff  int
+		wantSize int
+		wantHas  bool
 	}{
 		{"BODY[]<0.393216>", "BODY[]", 0, 393216, true},
 		{"BODY[]<1024.2048>", "BODY[]", 1024, 2048, true},
@@ -552,10 +552,10 @@ func TestSendCustomFetchWireFormat(t *testing.T) {
 	}()
 
 	msg := imapMessage{
-		ID:   "test-id",
-		UID:  42,
-		Size: 1234,
-		Flags: []string{"\\Seen"},
+		ID:      "test-id",
+		UID:     42,
+		Size:    1234,
+		Flags:   []string{"\\Seen"},
 		Created: time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC),
 	}
 
@@ -581,10 +581,10 @@ func TestSendCustomFetchWireFormatWithInternalDate(t *testing.T) {
 	}()
 
 	msg := imapMessage{
-		ID:   "test-id",
-		UID:  1,
-		Size: 500,
-		Flags: []string{},
+		ID:      "test-id",
+		UID:     1,
+		Size:    500,
+		Flags:   []string{},
 		Created: time.Date(2024, 6, 15, 14, 30, 0, 0, time.FixedZone("EST", -5*60*60)),
 	}
 
@@ -651,8 +651,6 @@ func TestSendCustomFetchMultipleMessages(t *testing.T) {
 	}
 }
 
-
-
 func TestBuildBodyStructureMessageRFC822(t *testing.T) {
 	// Test a message/rfc822 attachment structure
 	raw := []byte("Content-Type: message/rfc822\r\n\r\nSubject: nested\r\n\r\nbody")
@@ -676,7 +674,7 @@ func TestGetMIMEPartNonMultipart(t *testing.T) {
 
 func TestGetMIMEPartMultipart(t *testing.T) {
 	raw := []byte("Content-Type: multipart/mixed; boundary=\"x\"\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nPart1\r\n--x\r\nContent-Type: text/html\r\n\r\nPart2\r\n--x--\r\n")
-	
+
 	content, err := getMIMEPartContent(raw, "1")
 	if err != nil {
 		t.Fatalf("getMIMEPartContent(raw, 1) error: %v", err)
@@ -707,7 +705,7 @@ func TestGetMIMEPartMultipart(t *testing.T) {
 
 func TestGetMIMEPartMultipartHeader(t *testing.T) {
 	raw := []byte("Content-Type: multipart/mixed; boundary=\"x\"\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nBody text\r\n--x\r\nContent-Type: text/html\r\n\r\n<b>Body</b>\r\n--x--\r\n")
-	
+
 	// BODY[1.HEADER] — headers of first part
 	content, err := getMIMEPartContent(raw, "1.HEADER")
 	if err != nil {

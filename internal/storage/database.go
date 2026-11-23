@@ -301,7 +301,7 @@ func Ping() error {
 }
 
 // StatsGet returns the total/unread statistics for the INBOX.
-// This matches the web UI which only displays INBOX (Folder='') messages.
+// This matches the web UI which only displays INBOX (Folder=”) messages.
 func StatsGet() MailboxStats {
 	var (
 		total  = CountTotalInbox()
@@ -353,7 +353,7 @@ func CountRead() uint64 {
 	return uint64(total)
 }
 
-// CountTotalInbox returns the number of INBOX messages (Folder='').
+// CountTotalInbox returns the number of INBOX messages (Folder=”).
 func CountTotalInbox() uint64 {
 	var total float64 // use float64 for rqlite compatibility
 

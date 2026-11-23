@@ -20,4 +20,4 @@ Install dependencies with `npm ci`, then run:
 npm run test:e2e
 ```
 
-Playwright builds the frontend, starts Mailpit with an isolated temporary database, and checks desktop and mobile mailbox layouts in Chromium. Install its browser once with `npx playwright install chromium`, or set `PLAYWRIGHT_CHROMIUM_EXECUTABLE` to use a system Chromium binary.
+The CI workflows build the UI and Mailpit binary before Playwright starts Mailpit with an isolated temporary database. The E2E suite checks mailbox actions, message views, search, desktop and mobile layouts, and webroot routing. Install Chromium with `npx playwright install chromium`, or set `PLAYWRIGHT_CHROMIUM_EXECUTABLE` to use a system Chromium binary.

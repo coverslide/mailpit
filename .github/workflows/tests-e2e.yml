@@ -1,9 +1,9 @@
 name: Tests (e2e)
 on:
   pull_request:
-    branches: [ develop, 'feature/**' ]
+    branches: [ develop, 'feature/**', 'richard-develop' ]
   push:
-    branches: [ develop, 'feature/**' ]
+    branches: [ develop, 'feature/**', 'richard-develop' ]
 
 jobs:
   test-e2e:

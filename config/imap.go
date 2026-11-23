@@ -13,9 +13,9 @@ type ImapUserConfig struct {
 }
 
 type ImapConfigStruct struct {
-	BindAddr string `yaml:"bind-addr"`
-	TLSCert  string `yaml:"tls-cert"`
-	TLSKey   string `yaml:"tls-key"`
+	BindAddr string                    `yaml:"bind-addr"`
+	TLSCert  string                    `yaml:"tls-cert"`
+	TLSKey   string                    `yaml:"tls-key"`
 	Users    map[string]ImapUserConfig `yaml:"users"`
 }
 
