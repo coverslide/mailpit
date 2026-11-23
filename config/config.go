@@ -215,6 +215,10 @@ var (
 	// IMAPListen address - if set then Mailpit will start the IMAP server and listen on this address
 	IMAPListen = "[::]:1143"
 
+	// NginxAuthServer is the host returned in nginx mail auth responses.
+	// Defaults to 127.0.0.1, override with MP_NGINX_AUTH_SERVER.
+	NginxAuthServer = "127.0.0.1"
+
 	// IMAPTLSCert TLS certificate for IMAP
 	IMAPTLSCert string
 

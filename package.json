@@ -5,6 +5,7 @@
   "private": true,
   "scripts": {
     "build": "MINIFY=true node esbuild.config.mjs",
+    "test:e2e": "playwright test",
     "watch": "WATCH=true node esbuild.config.mjs",
     "package": "MINIFY=true node esbuild.config.mjs",
     "update-caniemail": "wget -O internal/htmlcheck/caniemail-data.json https://www.caniemail.com/api/data.json",
@@ -33,6 +34,7 @@
   "devDependencies": {
     "@eslint/compat": "^2.0.2",
     "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.65.1",
     "@popperjs/core": "^2.11.5",
     "@types/bootstrap": "^5.2.7",
     "@types/tinycon": "^0.6.3",

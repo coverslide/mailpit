@@ -24,14 +24,14 @@ import (
 // ---------------------------------------------------------------------------
 
 type imapTest struct {
-	t           *testing.T
-	client      net.Conn
-	server      net.Conn
-	reader      *bufio.Reader
-	rootDir     string
-	dbPath      string
-	cfgPath     string
-	tag         int
+	t       *testing.T
+	client  net.Conn
+	server  net.Conn
+	reader  *bufio.Reader
+	rootDir string
+	dbPath  string
+	cfgPath string
+	tag     int
 }
 
 func newIMAPTest(t *testing.T) *imapTest {
@@ -193,7 +193,7 @@ func (f *imapTest) readFetchResponse(tag string) (header string, literal []byte,
 }
 
 func storeMsg(raw []byte) string {
-	id, err := storage.Store(&raw, nil, "")
+	id, err := storage.Store(&raw, nil, "", "u")
 	if err != nil {
 		panic(fmt.Sprintf("Store: %v", err))
 	}
@@ -460,6 +460,41 @@ func TestE2EMailbox(t *testing.T) {
 	lines5 := f.cmd("CLOSE")
 	if !strings.Contains(lines5[0], "OK CLOSE") {
 		t.Errorf("CLOSE failed, got %q", lines5[0])
+	}
+}
+
+func TestE2ECustomMailboxLifecycle(t *testing.T) {
+	f := newIMAPTest(t)
+	defer f.close()
+	f.login("u", "pass")
+
+	if lines := f.cmd(`CREATE "Archive"`); !strings.Contains(lines[len(lines)-1], "OK CREATE") {
+		t.Fatalf("CREATE failed: %v", lines)
+	}
+	if lines := f.cmd(`CREATE "Archive"`); !strings.Contains(lines[len(lines)-1], "NO") {
+		t.Fatalf("duplicate CREATE should fail: %v", lines)
+	}
+	if lines := f.cmd(`CREATE INBOX`); !strings.Contains(lines[len(lines)-1], "NO") {
+		t.Fatalf("CREATE INBOX should fail: %v", lines)
+	}
+	lines := f.cmd(`LIST "" "*"`)
+	found := false
+	for _, line := range lines {
+		if strings.Contains(line, "Archive") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("LIST did not include custom mailbox: %v", lines)
+	}
+	if lines := f.cmd(`DELETE "Archive"`); !strings.Contains(lines[len(lines)-1], "OK DELETE") {
+		t.Fatalf("DELETE failed: %v", lines)
+	}
+	if lines := f.cmd(`DELETE "Archive"`); !strings.Contains(lines[len(lines)-1], "NO") {
+		t.Fatalf("deleting a missing mailbox should fail: %v", lines)
+	}
+	if lines := f.cmd(`DELETE INBOX`); !strings.Contains(lines[len(lines)-1], "NO") {
+		t.Fatalf("DELETE INBOX should fail: %v", lines)
 	}
 }
 
@@ -1423,4 +1458,345 @@ func TestE2EAppendPreservesInternalDate(t *testing.T) {
 	if !strings.Contains(fetch, "INTERNALDATE \"15-Jun-2026") {
 		t.Errorf("INTERNALDATE should be 15-Jun-2026, got %q", fetch)
 	}
+}
+
+// TestE2EMove tests MOVE from INBOX to Trash and back.
+func TestE2EMove(t *testing.T) {
+	f := newIMAPTest(t)
+	defer f.close()
+	f.login("u", "pass")
+
+	// Store a message in INBOX
+	storeMsg(msg("MoveMe", "move body"))
+	f.selectInbox()
+
+	// Verify 1 message
+	lines := f.cmd("FETCH 1 (FLAGS)")
+	if !strings.HasPrefix(lines[0], "* 1 FETCH") {
+		t.Fatalf("expected 1 message in INBOX, got %q", lines[0])
+	}
+
+	// MOVE to Trash
+	moveLines := f.cmd("MOVE 1 Trash")
+	last := moveLines[len(moveLines)-1]
+	if !strings.Contains(last, "OK MOVE") {
+		t.Fatalf("MOVE failed, got %q", last)
+	}
+
+	// Verify INBOX is now empty
+	tag := f.nextTag()
+	f.write(tag + " SELECT INBOX\r\n")
+	var existsCount string
+	for {
+		l := f.readLine()
+		if strings.HasPrefix(l, "* ") && strings.Contains(l, "EXISTS") {
+			existsCount = l
+		}
+		if strings.HasPrefix(l, tag+" ") {
+			break
+		}
+	}
+	if !strings.Contains(existsCount, "* 0 EXISTS") {
+		t.Errorf("expected 0 EXISTS in INBOX after MOVE, got %q", existsCount)
+	}
+
+	// SELECT Trash and verify 1 message
+	tag2 := f.nextTag()
+	f.write(tag2 + " SELECT Trash\r\n")
+	var trashExists string
+	for {
+		l := f.readLine()
+		if strings.HasPrefix(l, "* ") && strings.Contains(l, "EXISTS") {
+			trashExists = l
+		}
+		if strings.HasPrefix(l, tag2+" ") {
+			break
+		}
+	}
+	if !strings.Contains(trashExists, "* 1 EXISTS") {
+		t.Errorf("expected 1 EXISTS in Trash after MOVE, got %q", trashExists)
+	}
+
+	// MOVE back to INBOX
+	moveLines2 := f.cmd("MOVE 1 INBOX")
+	last2 := moveLines2[len(moveLines2)-1]
+	if !strings.Contains(last2, "OK MOVE") {
+		t.Fatalf("MOVE back failed, got %q", last2)
+	}
+
+	// Verify INBOX has 1 message again
+	tag3 := f.nextTag()
+	f.write(tag3 + " SELECT INBOX\r\n")
+	var backExists string
+	for {
+		l := f.readLine()
+		if strings.HasPrefix(l, "* ") && strings.Contains(l, "EXISTS") {
+			backExists = l
+		}
+		if strings.HasPrefix(l, tag3+" ") {
+			break
+		}
+	}
+	if !strings.Contains(backExists, "* 1 EXISTS") {
+		t.Errorf("expected 1 EXISTS in INBOX after MOVE back, got %q", backExists)
+	}
+}
+
+// TestE2EMoveMulti tests moving multiple messages at once.
+func TestE2EMoveMulti(t *testing.T) {
+	f := newIMAPTest(t)
+	defer f.close()
+	f.login("u", "pass")
+
+	// Store 3 messages
+	for i := 0; i < 3; i++ {
+		storeMsg(msg(fmt.Sprintf("M%d", i), fmt.Sprintf("body%d", i)))
+	}
+	f.selectInbox()
+
+	// Verify 3 messages
+	lines := f.cmd("FETCH 1:3 (FLAGS)")
+	if !strings.HasPrefix(lines[0], "* 1 FETCH") {
+		t.Fatalf("expected 3 messages in INBOX, got %q", lines[0])
+	}
+
+	// MOVE all to Sent
+	moveLines := f.cmd("MOVE 1:3 Sent")
+	last := moveLines[len(moveLines)-1]
+	if !strings.Contains(last, "OK MOVE") {
+		t.Fatalf("MOVE multi failed, got %q", last)
+	}
+
+	// Verify INBOX is empty
+	tag := f.nextTag()
+	f.write(tag + " SELECT INBOX\r\n")
+	var existsCount string
+	for {
+		l := f.readLine()
+		if strings.HasPrefix(l, "* ") && strings.Contains(l, "EXISTS") {
+			existsCount = l
+		}
+		if strings.HasPrefix(l, tag+" ") {
+			break
+		}
+	}
+	if !strings.Contains(existsCount, "* 0 EXISTS") {
+		t.Errorf("expected 0 EXISTS in INBOX after multi MOVE, got %q", existsCount)
+	}
+
+	// Verify Sent has 3
+	tag2 := f.nextTag()
+	f.write(tag2 + " SELECT Sent\r\n")
+	var sentExists string
+	for {
+		l := f.readLine()
+		if strings.HasPrefix(l, "* ") && strings.Contains(l, "EXISTS") {
+			sentExists = l
+		}
+		if strings.HasPrefix(l, tag2+" ") {
+			break
+		}
+	}
+	if !strings.Contains(sentExists, "* 3 EXISTS") {
+		t.Errorf("expected 3 EXISTS in Sent after multi MOVE, got %q", sentExists)
+	}
+}
+
+// TestE2ECrossUserSearchIsolation verifies that IMAP SEARCH returns only
+// the current user's messages, not messages belonging to other users.
+func TestE2ECrossUserSearchIsolation(t *testing.T) {
+	f := newIMAPTestMulti(t, []string{"u", "v"})
+	defer f.close()
+
+	// Store messages for user "u"
+	storeMsg(msg("u-subj", "u body"))
+	storeMsg(msg("v-subj", "v body"))
+
+	// Connect as user "u", SELECT INBOX
+	f.writeCmd("a001", "LOGIN u pass")
+	f.readUntil("a001 ")
+	f.writeCmd("a002", "SELECT INBOX")
+	f.readUntil("a002 ")
+
+	// SEARCH SUBJECT should find only u's message
+	lines := f.cmd(`SEARCH SUBJECT "u-subj"`)
+	last := lines[len(lines)-1]
+	if !strings.Contains(last, "OK SEARCH") {
+		t.Fatalf("expected OK SEARCH, got: %s", last)
+	}
+	for _, l := range lines {
+		if strings.Contains(l, "v-subj") {
+			t.Errorf("user u should NOT see user v's messages in SEARCH, got: %s", l)
+		}
+	}
+
+	// Connect as user "v"
+	f.writeCmdV("b001", "LOGIN v pass")
+	f.readUntilV("b001 ")
+	f.writeCmdV("b002", "SELECT INBOX")
+	f.readUntilV("b002 ")
+
+	// SEARCH SUBJECT should find only v's message
+	lines2 := f.cmdV(`SEARCH SUBJECT "v-subj"`)
+	last2 := lines2[len(lines2)-1]
+	if !strings.Contains(last2, "OK SEARCH") {
+		t.Fatalf("expected OK SEARCH, got: %s", last2)
+	}
+	for _, l := range lines2 {
+		if strings.Contains(l, "u-subj") {
+			t.Errorf("user v should NOT see user u's messages in SEARCH, got: %s", l)
+		}
+	}
+}
+
+// TestE2ESharedVsIMAPUserIsolation verifies that shared messages (UserID="")
+// are not visible to IMAP users, and IMAP users only see their own messages.
+func TestE2ESharedVsIMAPUserIsolation(t *testing.T) {
+	f := newIMAPTestMulti(t, []string{"u", "v"})
+	defer f.close()
+
+	// Store messages for user "u", user "v", and shared (no user)
+	storeMsg(msg("u-msg", "u body"))
+	storeMsg(msg("v-msg", "v body"))
+	storeMsg(msg("shared-msg", "shared body"))
+
+	// Connect as user "u"
+	f.writeCmd("a001", "LOGIN u pass")
+	f.readUntil("a001 ")
+	f.writeCmd("a002", "SELECT INBOX")
+	f.readUntil("a002 ")
+
+	// user "u" should see only 1 message (own), not 2 (not user v's or shared)
+	lines := f.cmd("FETCH 1 (BODY[HEADER.FIELDS (SUBJECT)])")
+	if lines[0] != "" && strings.Contains(lines[0], "v-msg") {
+		t.Errorf("user u should NOT see user v's messages")
+	}
+	if lines[0] != "" && strings.Contains(lines[0], "shared-msg") {
+		t.Errorf("user u should NOT see shared messages")
+	}
+
+	// Connect as user "v"
+	f.writeCmdV("b001", "LOGIN v pass")
+	f.readUntilV("b001 ")
+	f.writeCmdV("b002", "SELECT INBOX")
+	f.readUntilV("b002 ")
+
+	// user "v" should see only 1 message (own)
+	lines2 := f.cmdV("FETCH 1 (BODY[HEADER.FIELDS (SUBJECT)])")
+	if lines2[0] != "" && strings.Contains(lines2[0], "u-msg") {
+		t.Errorf("user v should NOT see user u's messages")
+	}
+	if lines2[0] != "" && strings.Contains(lines2[0], "shared-msg") {
+		t.Errorf("user v should NOT see shared messages")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// multi-user test fixture
+// ---------------------------------------------------------------------------
+
+type imapTestMulti struct {
+	*imapTest
+	userB *imapTest
+}
+
+func newIMAPTestMulti(t *testing.T, users []string) *imapTestMulti {
+	logger.NoLogging = true
+	config.MaxMessages = 0
+
+	root, err := os.MkdirTemp("", "mailpit-imap-e2e-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+
+	pwh := sha256.Sum256([]byte("pass"))
+	userMap := map[string]config.ImapUserConfig{}
+	yml := "users:\n"
+	for _, u := range users {
+		yml += fmt.Sprintf("  %s:\n    password-hash: %x\n", u, pwh)
+		userMap[u] = config.ImapUserConfig{PasswordHash: fmt.Sprintf("%x", pwh)}
+	}
+
+	cfgPath := filepath.Join(root, "imap.yaml")
+	if err := os.WriteFile(cfgPath, []byte(yml), 0644); err != nil {
+		os.RemoveAll(root)
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	config.IMAPConfigFile = cfgPath
+	config.IMAPConfig = config.ImapConfigStruct{Users: userMap}
+	config.Database = filepath.Join(root, "mailpit.db")
+
+	if err := storage.InitDB(); err != nil {
+		os.RemoveAll(root)
+		t.Fatalf("InitDB: %v", err)
+	}
+
+	// First connection (user A)
+	clientA, serverA := net.Pipe()
+	go handleClient(serverA)
+	readerA := bufio.NewReader(clientA)
+	g, _ := readerA.ReadString('\n')
+	if !strings.Contains(g, "OK") {
+		clientA.Close()
+		serverA.Close()
+		storage.Close()
+		os.RemoveAll(root)
+		t.Fatalf("bad greeting: %q", g)
+	}
+
+	// Second connection (user B)
+	clientB, serverB := net.Pipe()
+	go handleClient(serverB)
+	readerB := bufio.NewReader(clientB)
+	g2, _ := readerB.ReadString('\n')
+	if !strings.Contains(g2, "OK") {
+		clientA.Close()
+		serverA.Close()
+		clientB.Close()
+		serverB.Close()
+		storage.Close()
+		os.RemoveAll(root)
+		t.Fatalf("bad greeting: %q", g2)
+	}
+
+	a := &imapTest{t: t, client: clientA, server: serverA, reader: readerA, rootDir: root, dbPath: config.Database, cfgPath: cfgPath}
+	b := &imapTest{t: t, client: clientB, server: serverB, reader: readerB}
+
+	return &imapTestMulti{imapTest: a, userB: b}
+}
+
+func (f *imapTestMulti) close() {
+	f.userB.client.Close()
+	f.userB.server.Close()
+	f.imapTest.close()
+}
+
+// writeCmd sends a tagged command on user A's connection.
+func (f *imapTest) writeCmd(tag, cmd string) {
+	f.write(tag + " " + cmd + "\r\n")
+}
+
+// writeCmdV sends a tagged command on user B's connection.
+func (f *imapTestMulti) writeCmdV(tag, cmd string) {
+	f.userB.write(tag + " " + cmd + "\r\n")
+}
+
+// readUntilV reads lines until one starts with prefix on user B's connection.
+func (f *imapTestMulti) readUntilV(prefix string) []string {
+	var lines []string
+	for {
+		l := f.userB.readLine()
+		lines = append(lines, l)
+		if strings.HasPrefix(l, prefix) {
+			return lines
+		}
+	}
+}
+
+// cmdV sends a command with auto-incrementing tag on user B's connection.
+func (f *imapTestMulti) cmdV(line string) []string {
+	tag := f.userB.nextTag()
+	f.userB.write(tag + " " + line + "\r\n")
+	return f.readUntilV(tag + " ")
 }

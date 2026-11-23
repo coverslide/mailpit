@@ -28,15 +28,88 @@ var (
 	errorResponse   = regexp.MustCompile(`^5\d\d `)
 )
 
-// MailHandler handles the incoming message to store in the database
+// stripPlusAddress removes the +tag part from a local mailbox address.
+// e.g. "richard+tag@coverslide.me" → "richard@coverslide.me"
+func stripPlusAddress(email string) string {
+	at := strings.LastIndex(email, "@")
+	if at < 0 {
+		return email
+	}
+	local := email[:at]
+	plus := strings.Index(local, "+")
+	if plus >= 0 {
+		local = local[:plus]
+	}
+	return local + email[at:]
+}
+
+// MailHandler handles the incoming message to store in the database.
+// For IMAP users, separate copies are stored tagged to each user:
+// - Sender gets a copy in Sent (UserID=sender, Folder="Sent")
+// - Each IMAP recipient gets a copy in INBOX (UserID=recipient, Folder="")
+// - Non-IMAP addresses get a shared copy (UserID="", Folder="") for the web UI.
+// Plus-addresses (user+tag@host) are resolved to the base user for IMAP matching.
 func mailHandler(origin net.Addr, from string, to []string, data []byte, smtpUser *string) (string, error) {
-	return SaveToDatabase(origin, from, to, data, smtpUser, "")
+	senderAddr, _ := mail.ParseAddress(from)
+	senderEmail := ""
+	if senderAddr != nil {
+		senderEmail = strings.ToLower(strings.TrimSpace(senderAddr.Address))
+	}
+	senderBase := stripPlusAddress(senderEmail)
+	senderIsIMAP := senderBase != "" && storage.IMAPUserExists(senderBase)
+
+	// Track whether we stored any per-user copies
+	storedPerUser := false
+	var lastID string
+	var lastErr error
+
+	// Store a copy for each IMAP recipient in their INBOX
+	for _, addr := range to {
+		parsed, err := mail.ParseAddress(addr)
+		if err != nil {
+			continue
+		}
+		email := strings.ToLower(strings.TrimSpace(parsed.Address))
+		base := stripPlusAddress(email)
+		if base != "" && storage.IMAPUserExists(base) {
+			id, err := SaveToDatabase(origin, from, to, data, smtpUser, "", base)
+			if err != nil {
+				lastErr = err
+			} else {
+				lastID = id
+				storedPerUser = true
+			}
+		}
+	}
+
+	// Store a Sent copy for the IMAP sender
+	if senderIsIMAP {
+		id, err := SaveToDatabase(origin, from, to, data, smtpUser, "Sent", senderBase)
+		if err != nil {
+			lastErr = err
+		} else {
+			lastID = id
+			storedPerUser = true
+		}
+	}
+
+	// If no IMAP users were involved, store a shared copy for the web UI
+	if !storedPerUser {
+		id, err := SaveToDatabase(origin, from, to, data, smtpUser, "", "")
+		if err != nil {
+			return "", err
+		}
+		return id, nil
+	}
+
+	return lastID, lastErr
 }
 
 // SaveToDatabase will attempt to save a message to the database.
 // The folder parameter controls which IMAP folder the message appears in
 // (empty string for INBOX, "Sent" for Sent, etc.).
-func SaveToDatabase(origin net.Addr, from string, to []string, data []byte, smtpUser *string, folder string) (string, error) {
+// userID optionally assigns the message to a specific IMAP user's inbox.
+func SaveToDatabase(origin net.Addr, from string, to []string, data []byte, smtpUser *string, folder string, userID ...string) (string, error) {
 	if !config.SMTPStrictRFCHeaders && bytes.Contains(data, []byte("\r\r\n")) {
 		// replace all <CR><CR><LF> (\r\r\n) with <CR><LF> (\r\n)
 		// @see https://github.com/axllent/mailpit/issues/87 & https://github.com/axllent/mailpit/issues/153
@@ -139,7 +212,11 @@ func SaveToDatabase(origin net.Addr, from string, to []string, data []byte, smtp
 		logger.Log().Debugf("[smtpd] added missing addresses to Bcc header: %s", strings.Join(missingAddresses, ", "))
 	}
 
-	id, err := storage.Store(&data, smtpUser, folder)
+	var uid string
+	if len(userID) > 0 {
+		uid = userID[0]
+	}
+	id, err := storage.Store(&data, smtpUser, folder, uid)
 	if err != nil {
 		logger.Log().Errorf("[db] error storing message: %s", err.Error())
 		return "", err

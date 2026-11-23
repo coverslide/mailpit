@@ -135,30 +135,41 @@ func sendCustomFetch(conn net.Conn, seq int, msg imapMessage, attrs string) {
 		return
 	}
 
-	// Write FETCH response directly to connection — log summary without binary data
-	logger.Log().Debugf("[imap] fetch response: seq=%d uid=%d", seq, msg.UID)
-	fmt.Fprintf(conn, "* %d FETCH (", seq)
+	// Build FETCH response into buffer for wire-level logging
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "* %d FETCH (", seq)
 	first := true
 	for _, p := range allParts {
 		if !first {
-			fmt.Fprintf(conn, " ")
+			fmt.Fprintf(&buf, " ")
 		}
 		if p.data == nil {
-			fmt.Fprintf(conn, "%s", p.tag)
+			fmt.Fprintf(&buf, "%s", p.tag)
 		} else {
 			// LITERAL+ (RFC 7888): the "+" suffix tells the client not to
 			// send a continuation response, allowing the server to continue
 			// writing the FETCH response immediately after the literal data.
-			fmt.Fprintf(conn, "%s {%d+}\r\n", p.tag, len(p.data))
+			fmt.Fprintf(&buf, "%s {%d+}\r\n", p.tag, len(p.data))
 			if len(p.data) > 0 {
-				if _, err := conn.Write(p.data); err != nil {
-					return
-				}
+				buf.Write(p.data)
 			}
 		}
 		first = false
 	}
-	fmt.Fprintf(conn, ")\r\n")
+	fmt.Fprintf(&buf, ")\r\n")
+
+	// Log wire data: full response line + first 200 bytes of any literal data
+	wireStr := buf.String()
+	if len(wireStr) > 500 {
+		logger.Log().Debugf("[imap] FETCH wire seq=%d uid=%d: %s...(%d bytes total)", seq, msg.UID, wireStr[:500], len(wireStr))
+	} else {
+		logger.Log().Debugf("[imap] FETCH wire seq=%d uid=%d: %s", seq, msg.UID, wireStr)
+	}
+
+	// Write to connection
+	if _, err := conn.Write(buf.Bytes()); err != nil {
+		return
+	}
 }
 
 func formatFlags(flags []string) string {
@@ -1031,8 +1042,19 @@ func parseMessageSet(msgSet string, exists int, uidMode bool, messages []imapMes
 	var result []int
 	msgSet = strings.TrimSpace(msgSet)
 
+	// Determine the upper bound for "*" in uid mode use the highest UID,
+	// otherwise use the EXISTS count.
+	high := exists
+	if uidMode {
+		for _, m := range messages {
+			if int(m.UID) > high {
+				high = int(m.UID)
+			}
+		}
+	}
+
 	if msgSet == "*" {
-		for i := 1; i <= exists; i++ {
+		for i := 1; i <= high; i++ {
 			result = append(result, i)
 		}
 		return result
@@ -1044,25 +1066,41 @@ func parseMessageSet(msgSet string, exists int, uidMode bool, messages []imapMes
 		r = strings.TrimSpace(r)
 		if strings.Contains(r, ":") {
 			parts := strings.SplitN(r, ":", 2)
-			start, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
-			end, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
-			if err1 != nil || err2 != nil {
+			startStr := strings.TrimSpace(parts[0])
+			endStr := strings.TrimSpace(parts[1])
+
+			var start, end int
+			if startStr == "*" {
+				start = 1
+			} else {
+				start, _ = strconv.Atoi(startStr)
+			}
+			if endStr == "*" {
+				end = high
+			} else {
+				end, _ = strconv.Atoi(endStr)
+			}
+			if start == 0 && end == 0 {
 				continue
 			}
 			if start > end {
 				start, end = end, start
 			}
 			for i := start; i <= end; i++ {
-				if i <= exists {
+				if i >= 1 && i <= high {
 					result = append(result, i)
 				}
+			}
+		} else if r == "*" {
+			for i := 1; i <= high; i++ {
+				result = append(result, i)
 			}
 		} else {
 			n, err := strconv.Atoi(r)
 			if err != nil {
 				continue
 			}
-			if n >= 1 && n <= exists {
+			if n >= 1 && n <= high {
 				result = append(result, n)
 			}
 		}

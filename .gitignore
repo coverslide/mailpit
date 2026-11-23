@@ -1,4 +1,9 @@
 /node_modules/
+/playwright-report/
+/test-results/
+/testprofiler
+/coverage.out
+/coverage.html
 /send
 /sendmail/sendmail
 /server/ui/dist

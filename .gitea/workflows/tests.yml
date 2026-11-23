@@ -1,0 +1,33 @@
+name: Tests
+on:
+  pull_request:
+    branches: [develop, 'feature/**', 'imap-support*']
+  push:
+    branches: [develop, 'feature/**', 'imap-support*']
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Check Go formatting
+        run: test -z "$(gofmt -l .)"
+      - name: Run Go tests with coverage
+        run: go test -p 1 -coverprofile=coverage.out ./...
+      - name: Print Go coverage summary
+        run: go tool cover -func=coverage.out
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install JavaScript dependencies
+        run: npm ci
+      - name: Run JavaScript linting
+        run: npm run lint
+      - name: Test JavaScript packaging
+        run: npm run package
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Run frontend end-to-end tests
+        run: npm run test:e2e

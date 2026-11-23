@@ -393,6 +393,9 @@ func initConfigFromEnv() {
 	}
 	config.IMAPTLSCert = os.Getenv("MP_IMAP_TLS_CERT")
 	config.IMAPTLSKey = os.Getenv("MP_IMAP_TLS_KEY")
+	if len(os.Getenv("MP_NGINX_AUTH_SERVER")) > 0 {
+		config.NginxAuthServer = os.Getenv("MP_NGINX_AUTH_SERVER")
+	}
 
 	// Tagging
 	config.CLITagsArg = os.Getenv("MP_TAG")
