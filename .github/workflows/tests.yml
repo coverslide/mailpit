@@ -86,9 +86,12 @@ jobs:
       uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
       with:
         node-version: 22
+        cache: npm
+        cache-dependency-path: package-lock.json
     - name: Install JavaScript dependencies
       if: startsWith(matrix.os, 'ubuntu') == true
-      run: npm ci
+      timeout-minutes: 10
+      run: bash scripts/npm-ci.sh
     - name: Run JavaScript linting
       if: startsWith(matrix.os, 'ubuntu') == true
       run: npm run lint

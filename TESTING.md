@@ -1,5 +1,9 @@
 # Tests and coverage
 
+## CI dependency installation
+
+GitHub and Gitea test workflows cache npm's downloaded packages using `package-lock.json` as the cache key. They run `bash scripts/npm-ci.sh`, which uses the cache when possible, limits download concurrency, and retries a clean install up to three times only for npm network errors. Lockfile and lifecycle-script failures fail immediately. The install step has a ten-minute limit; persistent registry or runner connectivity problems still fail the job.
+
 ## Go coverage
 
 Run the full Go suite and write a coverage profile:

@@ -42,8 +42,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
       - name: Install JavaScript dependencies
-        run: npm ci
+        timeout-minutes: 10
+        run: bash scripts/npm-ci.sh
       - name: Run JavaScript linting
         run: npm run lint
       - name: Test JavaScript packaging

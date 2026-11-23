@@ -7,7 +7,7 @@ on:
 jobs:
   test-e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -16,8 +16,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
       - name: Install JavaScript dependencies
-        run: npm ci
+        timeout-minutes: 10
+        run: bash scripts/npm-ci.sh
       - name: Build the UI and Mailpit binary
         run: |
           npm run package
