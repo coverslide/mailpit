@@ -245,6 +245,14 @@ func apiRoutes() *http.ServeMux {
 	r.HandleFunc("GET "+config.Webroot+"api/v1/openapi.json", middleWareFunc(openAPISpec))
 	r.HandleFunc("GET "+config.Webroot+"api/v1/swagger.json", middleWareFunc(openAPISpec))
 
+	// IMAP user management
+	r.HandleFunc("GET "+config.Webroot+"api/v1/imap/users", middleWareFunc(apiv1.GetIMAPUsersHandler))
+	r.HandleFunc("POST "+config.Webroot+"api/v1/imap/users", middleWareFunc(apiv1.CreateIMAPUserHandler))
+	r.HandleFunc("DELETE "+config.Webroot+"api/v1/imap/users", middleWareFunc(apiv1.DeleteIMAPUserHandler))
+
+	// Nginx mail proxy auth (no middleware — nginx calls this directly)
+	r.HandleFunc("GET "+config.Webroot+"api/v1/auth", apiv1.NginxMailAuthHandler)
+
 	// Prometheus metrics (if enabled and using existing server)
 	if prometheus.GetMode() == "integrated" {
 		r.HandleFunc("GET "+config.Webroot+"metrics", middleWareFunc(func(w http.ResponseWriter, r *http.Request) {

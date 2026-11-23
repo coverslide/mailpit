@@ -28,10 +28,10 @@ var idleConns sync.Map
 
 // Diagnostic counters for debugging stalls.
 var (
-	inFlight   atomic.Int32
-	noopCount  atomic.Int64
-	cmdCount   atomic.Int64
-	connCount  atomic.Int32
+	inFlight  atomic.Int32
+	noopCount atomic.Int64
+	cmdCount  atomic.Int64
+	connCount atomic.Int32
 )
 
 func init() {
@@ -47,7 +47,7 @@ func init() {
 
 const (
 	// IMAP capability string
-	imapCapabilities = "IMAP4rev1 AUTH=PLAIN LITERAL+ NAMESPACE IDLE CHILDREN"
+	imapCapabilities = "IMAP4rev1 AUTH=PLAIN LITERAL+ NAMESPACE IDLE CHILDREN MOVE"
 )
 
 // Run will start the IMAP server if configured
@@ -95,11 +95,11 @@ func Run() {
 }
 
 type imapMessage struct {
-	ID        string
-	UID       uint64
-	Size      uint64
-	Flags     []string
-	Created   time.Time
+	ID      string
+	UID     uint64
+	Size    uint64
+	Flags   []string
+	Created time.Time
 }
 
 type clientState int
@@ -112,7 +112,7 @@ const (
 
 // standardMailbox defines a virtual IMAP folder with its special-use attribute.
 type standardMailbox struct {
-	Name        string
+	Name       string
 	SpecialUse string // RFC 6154 attribute, e.g. \Sent
 }
 
@@ -138,20 +138,21 @@ func isStandardMailbox(name string) bool {
 }
 
 type mailbox struct {
-	Name       string
-	Messages   []imapMessage
-	NextUID    uint64
-	Exists     int
-	Recent     int
-	Seen       int
-	ReadOnly   bool
+	Name     string
+	User     string
+	Messages []imapMessage
+	NextUID  uint64
+	Exists   int
+	Recent   int
+	Seen     int
+	ReadOnly bool
 }
 
 func handleClient(conn net.Conn) {
 	var (
-		state   = stateNotAuthenticated
-		user    = ""
-		mbox    *mailbox
+		state = stateNotAuthenticated
+		user  = ""
+		mbox  *mailbox
 	)
 
 	defer func() {
@@ -213,9 +214,17 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 		return true
 	}
 
-	// Handle IMAP literals (e.g., {5+}) in arguments
+	// Handle IMAP literals (e.g., {5} or {5+}) in arguments.
+	// For non-LITERAL+ ({N}), the server must send a "+" continuation response
+	// before reading literal data (RFC 3501 §7.5.1).
+	// For LITERAL+ ({N+}), the client sends data immediately without waiting.
 	for i, arg := range args {
 		if isLiteralPattern(arg) {
+			inner := arg[1 : len(arg)-1]
+			isLiteralPlus := len(inner) > 0 && inner[len(inner)-1] == '+'
+			if !isLiteralPlus {
+				sendResponse(conn, "+")
+			}
 			args[i] = readLiteralData(arg, reader)
 		}
 	}
@@ -229,6 +238,21 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 		sendResponse(conn, tag+" OK CAPABILITY completed")
 	case "NOOP":
 		noopCount.Add(1)
+		// If a mailbox is selected, re-check the count and send EXISTS if changed.
+		if *state == stateSelected && *mbox != nil {
+			folder := ""
+			upper := strings.ToUpper((*mbox).Name)
+			if upper != "INBOX" {
+				folder = (*mbox).Name
+			}
+			if total, _, _, err := storage.MailboxCounts(folder, *user); err == nil {
+				if int(total) != (*mbox).Exists {
+					(*mbox).Exists = int(total)
+					(*mbox).NextUID = uint64(total + 1)
+					sendResponse(conn, fmt.Sprintf("* %d EXISTS", total))
+				}
+			}
+		}
 		sendResponse(conn, tag+" OK NOOP completed")
 	case "LOGOUT":
 		sendResponse(conn, "* BYE Mailpit IMAP server logging out")
@@ -274,6 +298,7 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 		if authenticateIMAP(username, password) {
 			*state = stateAuthenticated
 			*user = username
+			_ = storage.RegisterIMAPUser(username)
 			sendResponse(conn, tag+" OK AUTHENTICATE completed")
 		} else {
 			sendResponse(conn, tag+" NO AUTHENTICATE failed")
@@ -294,6 +319,7 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 		if authenticateIMAP(username, password) {
 			*state = stateAuthenticated
 			*user = username
+			_ = storage.RegisterIMAPUser(username)
 			sendResponse(conn, tag+" OK LOGIN completed")
 		} else {
 			sendResponse(conn, tag+" NO LOGIN failed")
@@ -315,7 +341,6 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 
 		sendResponse(conn, fmt.Sprintf("* %d EXISTS", mb.Exists))
 		sendResponse(conn, fmt.Sprintf("* %d RECENT", mb.Recent))
-		sendResponse(conn, fmt.Sprintf("* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)"))
 		sendResponse(conn, "* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)")
 		sendResponse(conn, "* OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)] flags defined")
 		sendResponse(conn, fmt.Sprintf("* OK [UIDNEXT %d] predicted next UID", mb.NextUID))
@@ -368,11 +393,15 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 		if upper != "INBOX" && isStandardMailbox(mailboxName) {
 			folder = mailboxName
 		} else if upper != "INBOX" && !isStandardMailbox(mailboxName) {
-			sendResponse(conn, tag+" NO mailbox not found")
-			return true
+			// Check if it's a custom mailbox
+			if !storage.CustomMailboxExists(mailboxName, *user) {
+				sendResponse(conn, tag+" NO mailbox not found")
+				return true
+			}
+			folder = mailboxName
 		}
 
-		total, unread, nextUID, err := storage.MailboxCounts(folder)
+		total, unread, nextUID, err := storage.MailboxCounts(folder, *user)
 		if err != nil {
 			logger.Log().Errorf("[imap] status count error: %s", err.Error())
 			sendResponse(conn, tag+" NO status failed")
@@ -403,6 +432,17 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 				}
 			}
 		}
+		// Also list custom mailboxes for the current user
+		if *user != "" {
+			customMailboxes, err := storage.GetCustomMailboxes(*user)
+			if err == nil {
+				for _, name := range customMailboxes {
+					if matchMailboxWildcard(wildcard, name) {
+						sendResponse(conn, fmt.Sprintf(`* LIST (\HasNoChildren) "/" %s`, name))
+					}
+				}
+			}
+		}
 		sendResponse(conn, tag+" OK LIST completed")
 	case "LSUB":
 		if *state == stateNotAuthenticated {
@@ -414,6 +454,15 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 				sendResponse(conn, fmt.Sprintf(`* LSUB (\HasNoChildren %s) "/" %s`, mb.SpecialUse, mb.Name))
 			} else {
 				sendResponse(conn, fmt.Sprintf(`* LSUB (\HasNoChildren) "/" %s`, mb.Name))
+			}
+		}
+		// Also list custom mailboxes for the current user
+		if *user != "" {
+			customMailboxes, err := storage.GetCustomMailboxes(*user)
+			if err == nil {
+				for _, name := range customMailboxes {
+					sendResponse(conn, fmt.Sprintf(`* LSUB (\HasNoChildren) "/" %s`, name))
+				}
 			}
 		}
 		sendResponse(conn, tag+" OK LSUB completed")
@@ -428,7 +477,7 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 			sendResponse(conn, tag+" BAD no mailbox selected")
 			return true
 		}
-		handleStore(conn, tag, args, mbox)
+		handleStore(conn, tag, args, mbox, false)
 	case "SEARCH":
 		if *state != stateSelected {
 			sendResponse(conn, tag+" BAD no mailbox selected")
@@ -461,6 +510,27 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 		idleConns.Store(addr, time.Now())
 		logger.Log().Debugf("[imap] idle start: %s", addr)
 
+		// Register with the idle notifier to receive push notifications.
+		ic := storage.IdleNotify.RegisterIdle(conn, (*mbox).Name, *user)
+		defer storage.IdleNotify.UnregisterIdle(ic)
+
+		// Spawn a goroutine to forward notifications to the client.
+		go func() {
+			for {
+				select {
+				case <-ic.Done():
+					return
+				case response := <-ic.Notify():
+					// net.Conn supports concurrent reads/writes, safe to write here.
+					if _, err := fmt.Fprintf(conn, "%s\r\n", response); err != nil {
+						logger.Log().Debugf("[imap] idle-notify write error for %s: %s", addr, err)
+						return
+					}
+					logger.Log().Debugf("[imap] idle-notify sent to %s: %s", addr, response)
+				}
+			}
+		}()
+
 		sawDone := false
 		lastHeartbeat := time.Now()
 		for {
@@ -488,6 +558,7 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 		}
 
 		idleConns.Delete(addr)
+		storage.IdleNotify.UnregisterIdle(ic)
 		logger.Log().Debugf("[imap] idle end: %s (done=%v)", addr, sawDone)
 		sendResponse(conn, tag+" OK IDLE completed")
 	case "CHECK":
@@ -505,7 +576,7 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 			sendResponse(conn, tag+" BAD not authenticated")
 			return true
 		}
-		handleAppend(conn, tag, args)
+		handleAppend(conn, tag, args, *user)
 	case "EXPUNGE":
 		if *state != stateSelected {
 			sendResponse(conn, tag+" BAD no mailbox selected")
@@ -515,6 +586,63 @@ func handleCommand(conn net.Conn, reader *bufio.Reader, rawLine string, state *c
 			expungeMarked(conn, mbox)
 		}
 		sendResponse(conn, tag+" OK EXPUNGE completed")
+	case "CREATE":
+		if *state == stateNotAuthenticated {
+			sendResponse(conn, tag+" BAD not authenticated")
+			return true
+		}
+		if len(args) < 1 {
+			sendResponse(conn, tag+" BAD invalid arguments")
+			return true
+		}
+		mailboxName := strings.Trim(args[0], "\"")
+		upper := strings.ToUpper(mailboxName)
+		// Cannot create standard mailboxes or INBOX
+		if isStandardMailbox(mailboxName) || upper == "INBOX" {
+			sendResponse(conn, tag+" NO cannot create standard mailbox")
+			return true
+		}
+		created, err := storage.CreateCustomMailbox(mailboxName, *user)
+		if err != nil {
+			logger.Log().Errorf("[imap] create mailbox error: %s", err.Error())
+			sendResponse(conn, tag+" NO create failed")
+			return true
+		}
+		if !created {
+			sendResponse(conn, tag+" NO mailbox already exists")
+			return true
+		}
+		sendResponse(conn, tag+" OK CREATE completed")
+	case "DELETE":
+		if *state == stateNotAuthenticated {
+			sendResponse(conn, tag+" BAD not authenticated")
+			return true
+		}
+		if len(args) < 1 {
+			sendResponse(conn, tag+" BAD invalid arguments")
+			return true
+		}
+		mailboxName := strings.Trim(args[0], "\"")
+		if isStandardMailbox(mailboxName) || strings.EqualFold(mailboxName, "INBOX") {
+			sendResponse(conn, tag+" NO cannot delete standard mailbox")
+			return true
+		}
+		if !storage.CustomMailboxExists(mailboxName, *user) {
+			sendResponse(conn, tag+" NO mailbox does not exist")
+			return true
+		}
+		if err := storage.DeleteCustomMailbox(mailboxName, *user); err != nil {
+			logger.Log().Errorf("[imap] delete mailbox error: %s", err.Error())
+			sendResponse(conn, tag+" NO delete failed")
+			return true
+		}
+		sendResponse(conn, tag+" OK DELETE completed")
+	case "MOVE":
+		if *state != stateSelected {
+			sendResponse(conn, tag+" BAD no mailbox selected")
+			return true
+		}
+		handleMove(conn, tag, args, mbox, false)
 	default:
 		sendResponse(conn, tag+" BAD unknown command: "+cmd)
 	}
@@ -675,23 +803,25 @@ func authenticateIMAP(username, password string) bool {
 		return false
 	}
 
-	userCfg, ok := config.IMAPConfig.Users[username]
-	if !ok {
-		logger.Log().Debugf("[imap] unknown user %s", username)
-		return false
-	}
-
 	hash := sha256.Sum256([]byte(password))
 	passwordHash := hex.EncodeToString(hash[:])
 
-	logger.Log().Debugf("[imap] password hash for %s: %s (expected: %s)", username, passwordHash, userCfg.PasswordHash)
-
-	if userCfg.PasswordHash != passwordHash {
-		logger.Log().Debugf("[imap] invalid password for user %s", username)
-		return false
+	// Check the database for the user
+	if storage.IMAPUserAuth(username, passwordHash) {
+		return true
 	}
 
-	return true
+	// Fall back to static config (for initial seed or when no DB user exists)
+	if userCfg, ok := config.IMAPConfig.Users[username]; ok {
+		if userCfg.PasswordHash == passwordHash {
+			// Seed into DB for future logins
+			_ = storage.SetIMAPUserPassword(username, passwordHash)
+			return true
+		}
+	}
+
+	logger.Log().Debugf("[imap] auth failed for user %s", username)
+	return false
 }
 
 func openMailbox(name string, user string, readOnly bool) mailbox {
@@ -703,20 +833,26 @@ func openMailbox(name string, user string, readOnly bool) mailbox {
 	upper := strings.ToUpper(name)
 	if upper != "INBOX" {
 		if !isStandardMailbox(name) {
-			return mailbox{Name: name, ReadOnly: readOnly}
+			// Check if it's a custom mailbox
+			if !storage.CustomMailboxExists(name, user) {
+				return mailbox{Name: name, ReadOnly: readOnly}
+			}
+			folder = name
+		} else {
+			folder = name
 		}
-		folder = name
 	}
 
-	messages, err := storage.List(0, 0, 0, folder)
+	messages, err := storage.List(0, 0, 0, folder, user)
 	if err != nil {
 		logger.Log().Errorf("[imap] %s", err.Error())
 		return mailbox{}
 	}
 
 	mb := mailbox{
-		Name:       name,
-		ReadOnly:   readOnly,
+		Name:     name,
+		User:     user,
+		ReadOnly: readOnly,
 	}
 
 	for i := len(messages) - 1; i >= 0; i-- {
@@ -730,10 +866,10 @@ func openMailbox(name string, user string, readOnly bool) mailbox {
 		}
 		seq := len(messages) - i
 		mb.Messages = append(mb.Messages, imapMessage{
-			ID:    m.ID,
-			UID:   uint64(seq),
-			Size:  m.Size,
-			Flags: flags,
+			ID:      m.ID,
+			UID:     uint64(seq),
+			Size:    m.Size,
+			Flags:   flags,
 			Created: m.Created,
 		})
 	}
@@ -829,9 +965,13 @@ func handleUID(conn net.Conn, tag string, args []string, mbox **mailbox) {
 	case "FETCH":
 		handleFetch(conn, tag, subArgs, mbox, true)
 	case "STORE":
-		handleStore(conn, tag, subArgs, mbox)
+		handleStore(conn, tag, subArgs, mbox, true)
 	case "SEARCH":
 		handleSearch(conn, tag, subArgs, **mbox)
+	case "COPY":
+		handleCopy(conn, tag, subArgs, **mbox, true)
+	case "MOVE":
+		handleMove(conn, tag, subArgs, mbox, true)
 	default:
 		sendResponse(conn, tag+" BAD unknown UID command")
 	}
@@ -868,7 +1008,7 @@ func handleFetch(conn net.Conn, tag string, args []string, mbox **mailbox, uidMo
 	sendResponse(conn, tag+" OK FETCH completed")
 }
 
-func handleStore(conn net.Conn, tag string, args []string, mbox **mailbox) {
+func handleStore(conn net.Conn, tag string, args []string, mbox **mailbox, uidMode bool) {
 	if len(args) < 3 {
 		sendResponse(conn, tag+" BAD invalid arguments")
 		return
@@ -895,7 +1035,7 @@ func handleStore(conn net.Conn, tag string, args []string, mbox **mailbox) {
 		}
 	}
 
-	indices := parseMessageSet(msgSet, (*mbox).Exists, false, (*mbox).Messages)
+	indices := parseMessageSet(msgSet, (*mbox).Exists, uidMode, (*mbox).Messages)
 
 	for _, idx := range indices {
 		if idx < 1 || idx > len((*mbox).Messages) {
@@ -918,6 +1058,9 @@ func handleStore(conn net.Conn, tag string, args []string, mbox **mailbox) {
 		if action == actionBase {
 			sendResponse(conn, fmt.Sprintf("* %d FETCH (FLAGS (%s))", idx, strings.Join(msg.Flags, " ")))
 		}
+
+		// Notify other IDLEing clients on the same mailbox about the flag change.
+		storage.IdleNotify.NotifyFlagChangeUser((*mbox).User, (*mbox).Name, idx, msg.Flags)
 	}
 
 	sendResponse(conn, tag+" OK STORE completed")
@@ -1414,7 +1557,7 @@ func stripQuotes(s string) string {
 
 func searchBySubject(mbox mailbox, term string) (map[string]bool, error) {
 	term = stripQuotes(term)
-	ids, err := storage.SearchIDsBySubject(term)
+	ids, err := storage.SearchIDsBySubject(term, mbox.User)
 	if err != nil {
 		return nil, err
 	}
@@ -1427,7 +1570,7 @@ func searchBySubject(mbox mailbox, term string) (map[string]bool, error) {
 
 func searchByMetadata(mbox mailbox, field, term string) (map[string]bool, error) {
 	term = stripQuotes(term)
-	ids, err := storage.SearchIDsByMetadata(field, term)
+	ids, err := storage.SearchIDsByMetadata(field, term, mbox.User)
 	if err != nil {
 		return nil, err
 	}
@@ -1440,7 +1583,7 @@ func searchByMetadata(mbox mailbox, field, term string) (map[string]bool, error)
 
 func searchBySearchText(mbox mailbox, term string) (map[string]bool, error) {
 	term = stripQuotes(term)
-	ids, err := storage.SearchIDsBySearchText(term)
+	ids, err := storage.SearchIDsBySearchText(term, mbox.User)
 	if err != nil {
 		return nil, err
 	}
@@ -1458,7 +1601,7 @@ func searchSince(mbox mailbox, dateStr string) (map[string]bool, error) {
 		return nil, fmt.Errorf("invalid date: %s", dateStr)
 	}
 	ts := t.UnixMilli()
-	ids, err := storage.SearchIDsByCreated(">=", ts)
+	ids, err := storage.SearchIDsByCreated(">=", ts, mbox.User)
 	if err != nil {
 		return nil, err
 	}
@@ -1476,7 +1619,7 @@ func searchBefore(mbox mailbox, dateStr string) (map[string]bool, error) {
 		return nil, fmt.Errorf("invalid date: %s", dateStr)
 	}
 	ts := t.UnixMilli()
-	ids, err := storage.SearchIDsByCreated("<", ts)
+	ids, err := storage.SearchIDsByCreated("<", ts, mbox.User)
 	if err != nil {
 		return nil, err
 	}
@@ -1494,8 +1637,8 @@ func searchOn(mbox mailbox, dateStr string) (map[string]bool, error) {
 		return nil, fmt.Errorf("invalid date: %s", dateStr)
 	}
 	startOfDay := t.UnixMilli()
-	endOfDay := t.Add(24 * time.Hour).UnixMilli() - 1
-	ids, err := storage.SearchIDsByCreatedBetween(startOfDay, endOfDay)
+	endOfDay := t.Add(24*time.Hour).UnixMilli() - 1
+	ids, err := storage.SearchIDsByCreatedBetween(startOfDay, endOfDay, mbox.User)
 	if err != nil {
 		return nil, err
 	}
@@ -1511,7 +1654,7 @@ func searchSmaller(mbox mailbox, sizeStr string) (map[string]bool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid size: %s", sizeStr)
 	}
-	ids, err := storage.SearchIDsBySize("<", size)
+	ids, err := storage.SearchIDsBySize("<", size, mbox.User)
 	if err != nil {
 		return nil, err
 	}
@@ -1527,7 +1670,7 @@ func searchLarger(mbox mailbox, sizeStr string) (map[string]bool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid size: %s", sizeStr)
 	}
-	ids, err := storage.SearchIDsBySize(">", size)
+	ids, err := storage.SearchIDsBySize(">", size, mbox.User)
 	if err != nil {
 		return nil, err
 	}
@@ -1622,7 +1765,7 @@ func matchMailboxWildcard(wildcard, name string) bool {
 }
 
 // handleAppend processes the APPEND command: APPEND mailbox [flags] [date-time] literal
-func handleAppend(conn net.Conn, tag string, args []string) {
+func handleAppend(conn net.Conn, tag string, args []string, user string) {
 	if len(args) < 2 {
 		sendResponse(conn, tag+" BAD invalid arguments")
 		return
@@ -1636,9 +1779,13 @@ func handleAppend(conn net.Conn, tag string, args []string) {
 	if upper != "INBOX" && isStandardMailbox(mailboxName) {
 		folder = mailboxName
 	} else if upper != "INBOX" && !isStandardMailbox(mailboxName) {
-		// Unknown mailbox — reject for now
-		sendResponse(conn, tag+" NO mailbox not found")
-		return
+		// Check if it's a custom mailbox
+		if storage.CustomMailboxExists(mailboxName, user) {
+			folder = mailboxName
+		} else {
+			sendResponse(conn, tag+" NO mailbox not found")
+			return
+		}
 	}
 
 	// Parse optional flags and date-time from middle args
@@ -1665,7 +1812,7 @@ func handleAppend(conn net.Conn, tag string, args []string) {
 	}
 
 	body := []byte(messageData)
-	id, err := storage.Store(&body, nil, folder)
+	id, err := storage.Store(&body, nil, folder, user)
 	if err != nil {
 		sendResponse(conn, tag+" NO store failed: "+err.Error())
 		return
@@ -1690,10 +1837,15 @@ func handleAppend(conn net.Conn, tag string, args []string) {
 }
 
 // handleCopy processes the COPY command: COPY sequence-set mailbox
-func handleCopy(conn net.Conn, tag string, args []string, mbox mailbox) {
+func handleCopy(conn net.Conn, tag string, args []string, mbox mailbox, uidMode ...bool) {
 	if len(args) < 2 {
 		sendResponse(conn, tag+" BAD invalid arguments")
 		return
+	}
+
+	um := false
+	if len(uidMode) > 0 {
+		um = uidMode[0]
 	}
 
 	msgSet := args[0]
@@ -1705,11 +1857,16 @@ func handleCopy(conn net.Conn, tag string, args []string, mbox mailbox) {
 	if upper != "INBOX" && isStandardMailbox(destName) {
 		destFolder = destName
 	} else if upper != "INBOX" && !isStandardMailbox(destName) {
-		sendResponse(conn, tag+" NO destination mailbox not found")
-		return
+		// Check if it's a custom mailbox
+		if storage.CustomMailboxExists(destName, mbox.User) {
+			destFolder = destName
+		} else {
+			sendResponse(conn, tag+" NO destination mailbox not found")
+			return
+		}
 	}
 
-	indices := parseMessageSet(msgSet, mbox.Exists, false, mbox.Messages)
+	indices := parseMessageSet(msgSet, mbox.Exists, um, mbox.Messages)
 
 	for _, idx := range indices {
 		if idx < 1 || idx > len(mbox.Messages) {
@@ -1720,7 +1877,7 @@ func handleCopy(conn net.Conn, tag string, args []string, mbox mailbox) {
 		if err != nil {
 			continue
 		}
-		newID, err := storage.Store(&raw, nil, destFolder)
+		newID, err := storage.Store(&raw, nil, destFolder, mbox.User)
 		if err != nil || newID == "" {
 			continue
 		}
@@ -1730,4 +1887,81 @@ func handleCopy(conn net.Conn, tag string, args []string, mbox mailbox) {
 	}
 
 	sendResponse(conn, tag+" OK COPY completed")
+}
+
+// handleMove processes the MOVE command: MOVE sequence-set mailbox
+// This moves messages from the current mailbox to the destination mailbox
+func handleMove(conn net.Conn, tag string, args []string, mbox **mailbox, uidMode bool) {
+	if len(args) < 2 {
+		sendResponse(conn, tag+" BAD invalid arguments")
+		return
+	}
+
+	if (*mbox).ReadOnly {
+		mboxReply(conn, tag, "NO", "mailbox is read-only")
+		return
+	}
+
+	msgSet := args[0]
+	destName := strings.Trim(args[1], "\"")
+
+	// Determine destination folder
+	destFolder := ""
+	upper := strings.ToUpper(destName)
+	if upper != "INBOX" && isStandardMailbox(destName) {
+		destFolder = destName
+	} else if upper == "INBOX" {
+		destFolder = ""
+	} else {
+		// Check if it's a custom mailbox
+		if storage.CustomMailboxExists(destName, (*mbox).User) {
+			destFolder = destName
+		} else {
+			sendResponse(conn, tag+" NO destination mailbox not found")
+			return
+		}
+	}
+
+	indices := parseMessageSet(msgSet, (*mbox).Exists, uidMode, (*mbox).Messages)
+
+	var movedIDs []string
+	var newMessages []imapMessage
+
+	for _, idx := range indices {
+		if idx < 1 || idx > len((*mbox).Messages) {
+			continue
+		}
+		msg := (*mbox).Messages[idx-1]
+		// Move the message by updating its Folder column
+		if err := storage.MoveMessage(msg.ID, destFolder); err != nil {
+			logger.Log().Errorf("[imap] error moving message: %s", err.Error())
+			continue
+		}
+		movedIDs = append(movedIDs, msg.ID)
+	}
+
+	// Remove moved messages from the in-memory mailbox
+	if len(movedIDs) > 0 {
+		for _, m := range (*mbox).Messages {
+			deleted := false
+			for _, id := range movedIDs {
+				if m.ID == id {
+					deleted = true
+					break
+				}
+			}
+			if !deleted {
+				newMessages = append(newMessages, m)
+			}
+		}
+		// Renumber UIDs
+		for i := range newMessages {
+			newMessages[i].UID = uint64(i + 1)
+		}
+		(*mbox).Messages = newMessages
+		(*mbox).Exists = len(newMessages)
+		(*mbox).NextUID = uint64(len(newMessages) + 1)
+	}
+
+	sendResponse(conn, tag+" OK MOVE completed")
 }

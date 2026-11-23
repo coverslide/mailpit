@@ -2,6 +2,8 @@ package server
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -261,6 +263,98 @@ func TestAPIv1ToggleReadStatus(t *testing.T) {
 		t.Error(err.Error())
 	}
 	assertStatsEqual(t, ts.URL+"/api/v1/messages", 0, 100)
+}
+
+func TestAPIv1IMAPUserLifecycle(t *testing.T) {
+	setup()
+	defer storage.Close()
+	config.IMAPConfig.Users = map[string]config.ImapUserConfig{}
+	r := apiRoutes()
+	ts := httptest.NewServer(r)
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/api/v1/imap/users", "application/json", strings.NewReader(`{"username":"alice","password":"secret"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+	if !storage.IMAPUserAuth("alice", "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b") {
+		t.Fatal("created user password was not stored as the expected SHA-256 hash")
+	}
+
+	resp, err = http.Get(ts.URL + "/api/v1/imap/users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var users []string
+	if err := json.NewDecoder(resp.Body).Decode(&users); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || len(users) != 1 || users[0] != "alice" {
+		t.Fatalf("list response = (%d, %+v), want (200, [alice])", resp.StatusCode, users)
+	}
+
+	resp, err = http.Post(ts.URL+"/api/v1/imap/users", "application/json", strings.NewReader(`{"username":"","password":"secret"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid create status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/imap/users?username=alice", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent || storage.IMAPUserExists("alice") {
+		t.Fatalf("delete status = %d; user still exists=%v", resp.StatusCode, storage.IMAPUserExists("alice"))
+	}
+}
+
+func TestNginxMailAuthHandler(t *testing.T) {
+	setup()
+	defer storage.Close()
+	config.IMAPListen = "127.0.0.1:1143"
+	config.SMTPListen = "127.0.0.1:1025"
+	config.NginxAuthServer = "127.0.0.1"
+	config.IMAPConfig.Users = map[string]config.ImapUserConfig{}
+
+	hash := sha256.Sum256([]byte("secret"))
+	if err := storage.SetIMAPUserPassword("alice", hex.EncodeToString(hash[:])); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name, protocol, pass, wantPort, wantStatus string
+	}{
+		{"imap success", "imap", "secret", "1143", "OK"},
+		{"smtp success", "smtp", "secret", "1025", "OK"},
+		{"bad password", "imap", "wrong", "", "Invalid login or password"},
+		{"missing username", "imap", "secret", "", "Invalid login or password"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/auth", nil)
+			req.Header.Set("Auth-User", "alice")
+			if tc.name == "missing username" {
+				req.Header.Del("Auth-User")
+			}
+			req.Header.Set("Auth-Pass", tc.pass)
+			req.Header.Set("Auth-Protocol", tc.protocol)
+			rr := httptest.NewRecorder()
+			apiv1.NginxMailAuthHandler(rr, req)
+			if rr.Code != http.StatusOK || rr.Header().Get("Auth-Status") != tc.wantStatus || rr.Header().Get("Auth-Port") != tc.wantPort {
+				t.Fatalf("auth response = status %d, headers %v; want status 200, Auth-Status=%q, Auth-Port=%q", rr.Code, rr.Header(), tc.wantStatus, tc.wantPort)
+			}
+		})
+	}
 }
 
 func TestAPIv1Search(t *testing.T) {

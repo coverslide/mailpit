@@ -754,7 +754,7 @@ func TestFullIMAPConversation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = storage.Store(&msgData, nil, "")
+	_, err = storage.Store(&msgData, nil, "", "test")
 	if err != nil {
 		t.Fatal(err)
 	}

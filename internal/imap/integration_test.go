@@ -123,7 +123,7 @@ func (ct *clientTest) selectInbox() *imap.MailboxStatus {
 
 func storeTestMessage(t *testing.T, raw []byte) string {
 	t.Helper()
-	id, err := storage.Store(&raw, nil, "")
+	id, err := storage.Store(&raw, nil, "", "u")
 	if err != nil {
 		t.Fatalf("storeTestMessage: %v", err)
 	}
@@ -171,12 +171,12 @@ func TestIntegrationCapability(t *testing.T) {
 	}
 	t.Logf("Server capabilities: %v", caps)
 
-	for _, must := range []string{"IMAP4rev1", "AUTH=PLAIN", "LITERAL+", "NAMESPACE"} {
+	for _, must := range []string{"IMAP4rev1", "AUTH=PLAIN", "LITERAL+", "NAMESPACE", "MOVE"} {
 		if !caps[must] {
 			t.Errorf("server does not advertise %s", must)
 		}
 	}
-	for _, mustNot := range []string{"MOVE", "LOGIN-REFERRALS", "UIDPLUS"} {
+	for _, mustNot := range []string{"LOGIN-REFERRALS", "UIDPLUS"} {
 		if caps[mustNot] {
 			t.Errorf("server advertises %s but does not implement it", mustNot)
 		}

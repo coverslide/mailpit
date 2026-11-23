@@ -1,9 +1,9 @@
 name: Tests
 on:
   pull_request:
-    branches: [ develop, 'feature/**' ]
+    branches: [ develop, 'feature/**', 'imap-support*' ]
   push:
-    branches: [ develop, 'feature/**' ]
+    branches: [ develop, 'feature/**', 'imap-support*' ]
 jobs:
   test:
     strategy:
@@ -42,7 +42,7 @@ jobs:
       # use bash on all platforms: PowerShell (Windows default) does not support "\" line continuation
       shell: bash
       run: |
-        go test -v \
+        go test -p 1 -coverprofile=coverage.out -v \
           ./cmd \
           ./config \
           ./internal/auth \
@@ -51,6 +51,7 @@ jobs:
           ./internal/healthcheck \
           ./internal/html2text \
           ./internal/htmlcheck \
+          ./internal/imap \
           ./internal/linkcheck \
           ./internal/logger \
           ./internal/mimeparser \
@@ -74,6 +75,8 @@ jobs:
           ./server/handlers \
           ./server/websockets \
           ./sendmail/cmd
+    - name: Print Go coverage summary
+      run: go tool cover -func=coverage.out
     - name: Run Go benchmarking
       run: go test -p 1 ./internal/storage ./internal/html2text -bench=.
     

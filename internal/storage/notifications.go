@@ -35,8 +35,8 @@ func BroadcastMailboxStats() {
 			Unread  uint64
 			Version string
 		}{
-			Total:   CountTotal(),
-			Unread:  CountUnread(),
+			Total:   CountTotalInbox(),
+			Unread:  CountUnreadInbox(),
 			Version: config.Version,
 		}
 

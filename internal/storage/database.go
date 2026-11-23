@@ -213,6 +213,20 @@ func InitDB() error {
 		return err
 	}
 
+	// Ensure imap_users has PasswordHash column (data migration for pre-1.26.0 DBs)
+	ensureIMAPUsersPasswordHash()
+
+	// Seed IMAP users from config into the database
+	if len(config.IMAPConfig.Users) > 0 {
+		users := make(map[string]string)
+		for username, userCfg := range config.IMAPConfig.Users {
+			users[username] = userCfg.PasswordHash
+		}
+		if err := SeedIMAPUsers(users); err != nil {
+			logger.Log().Warnf("[db] error seeding IMAP users: %s", err.Error())
+		}
+	}
+
 	LoadTagFilters()
 
 	dbLastAction.touch()
@@ -246,6 +260,21 @@ func tenant(table string) string {
 	return fmt.Sprintf("%s%s", config.TenantID, table)
 }
 
+// ensureIMAPUsersPasswordHash adds the PasswordHash column to imap_users
+// if it doesn't exist yet. This is a data migration for databases created
+// before the column was added.
+func ensureIMAPUsersPasswordHash() {
+	tbl := tenant("imap_users")
+	var colCount int
+	err := db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM pragma_table_info('%s') WHERE name='PasswordHash'`, tbl)).Scan(&colCount)
+	if err != nil || colCount > 0 {
+		return
+	}
+	if _, err := db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN PasswordHash TEXT NOT NULL DEFAULT ''`, tbl)); err != nil {
+		logger.Log().Warnf("[db] failed to add PasswordHash column to %s: %s", tbl, err.Error())
+	}
+}
+
 // Close will close the database, and delete if temporary
 func Close() {
 	// on a fatal exit (eg: ports blocked), allow Mailpit to run migration tasks before closing the DB
@@ -271,11 +300,12 @@ func Ping() error {
 	return db.Ping()
 }
 
-// StatsGet returns the total/unread statistics for a mailbox
+// StatsGet returns the total/unread statistics for the INBOX.
+// This matches the web UI which only displays INBOX (Folder='') messages.
 func StatsGet() MailboxStats {
 	var (
-		total  = CountTotal()
-		unread = CountUnread()
+		total  = CountTotalInbox()
+		unread = CountUnreadInbox()
 		tags   = GetAllTags()
 	)
 
@@ -318,6 +348,31 @@ func CountRead() uint64 {
 	_ = sqlf.From(tenant("mailbox")).
 		Select("COUNT(*)").To(&total).
 		Where("Read = ?", 1).
+		QueryRowAndClose(context.TODO(), db)
+
+	return uint64(total)
+}
+
+// CountTotalInbox returns the number of INBOX messages (Folder='').
+func CountTotalInbox() uint64 {
+	var total float64 // use float64 for rqlite compatibility
+
+	_ = sqlf.From(tenant("mailbox")).
+		Select("COUNT(*)").To(&total).
+		Where("Folder = ?", "").
+		QueryRowAndClose(context.TODO(), db)
+
+	return uint64(total)
+}
+
+// CountUnreadInbox returns the number of unread INBOX messages.
+func CountUnreadInbox() uint64 {
+	var total float64 // use float64 for rqlite compatibility
+
+	_ = sqlf.From(tenant("mailbox")).
+		Select("COUNT(*)").To(&total).
+		Where("Read = ?", 0).
+		Where("Folder = ?", "").
 		QueryRowAndClose(context.TODO(), db)
 
 	return uint64(total)

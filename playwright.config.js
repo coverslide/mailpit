@@ -21,8 +21,15 @@ export default defineConfig({
 	forbidOnly: !!process.env.CI,
 	// retries would hide flakiness, so we do not use them
 	retries: 0,
-	reporter: process.env.CI ? [["list"], ["github"], ["html", { open: "never" }]] : "list",
-	use: { trace: "retain-on-failure" },
+	reporter: process.env.GITHUB_ACTIONS
+		? [["list"], ["github"], ["html", { open: "never" }]]
+		: [["list"], ["html", { open: "never" }]],
+	use: {
+		trace: "retain-on-failure",
+		launchOptions: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
+			? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE }
+			: undefined,
+	},
 	// patterns are matched against the absolute path, so anchor them to the file name
 	projects: [
 		{ name: "default", testIgnore: /[\\/]webroot\.spec\.js$/, use: { baseURL: "http://127.0.0.1:18025/" } },
