@@ -4,6 +4,7 @@
 /testprofiler
 /coverage.out
 /coverage.html
+/coverage/
 /send
 /sendmail/sendmail
 /server/ui/dist

@@ -15,9 +15,30 @@ jobs:
       - name: Check Go formatting
         run: test -z "$(gofmt -l .)"
       - name: Run Go tests with coverage
+        id: go-tests
         run: go test -p 1 -coverprofile=coverage.out ./...
-      - name: Print Go coverage summary
-        run: go tool cover -func=coverage.out
+      - name: Generate Go coverage reports
+        id: coverage-report
+        if: ${{ !cancelled() && steps.go-tests.outcome != 'skipped' && hashFiles('coverage.out') != '' }}
+        shell: bash
+        env:
+          GO_TEST_OUTCOME: ${{ steps.go-tests.outcome }}
+        run: |
+          mkdir -p coverage/go
+          cp coverage.out coverage/go/coverage.out
+          go tool cover -func=coverage.out | tee coverage/go/summary.txt
+          go tool cover -html=coverage.out -o coverage/go/index.html
+          git rev-parse HEAD > coverage/go/commit.txt
+          printf 'Go test outcome: %s\nCoverage from a failed run may be incomplete.\n' "$GO_TEST_OUTCOME" > coverage/go/test-status.txt
+      - name: Upload Go coverage
+        if: ${{ !cancelled() && steps.coverage-report.outcome == 'success' }}
+        # Gitea-compatible uploader; the upstream GitHub action rejects GHES/Gitea.
+        uses: https://github.com/christopherhx/gitea-upload-artifact@62ac910c5d3dfa85c7cb2df15afe2e342b2407c2
+        with:
+          name: go-coverage
+          path: coverage/go/
+          if-no-files-found: error
+          retention-days: 30
       - uses: actions/setup-node@v4
         with:
           node-version: 22
